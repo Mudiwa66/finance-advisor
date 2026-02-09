@@ -1,0 +1,5 @@
+# Sensitive financial data - NEVER commit
+data/
+
+# macOS
+.DS_Store
