@@ -6,8 +6,12 @@ import re
 from collections import Counter
 from pathlib import Path
 
+import requests as http_requests
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
+
+OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = "llama3.2"
 
 # ---------------------------------------------------------------------------
 # Load transaction data once at startup
@@ -17,6 +21,90 @@ DATA_FILE = Path(__file__).parent / "data" / "transactions.json"
 
 with open(DATA_FILE) as f:
     TRANSACTIONS: list[dict] = json.load(f)
+
+# ---------------------------------------------------------------------------
+# Ollama LLM integration
+# ---------------------------------------------------------------------------
+
+
+def build_spending_summary() -> str:
+    """Pre-compute a text summary of all transactions for the LLM system prompt."""
+    total_debits = sum(t["amount"] for t in TRANSACTIONS if t["amount"] < 0)
+    total_credits = sum(t["amount"] for t in TRANSACTIONS if t["amount"] > 0)
+    debit_count = sum(1 for t in TRANSACTIONS if t["amount"] < 0)
+    credit_count = sum(1 for t in TRANSACTIONS if t["amount"] > 0)
+    closing_balance = TRANSACTIONS[-1]["balance"]
+    first_date = TRANSACTIONS[0]["date"]
+    last_date = TRANSACTIONS[-1]["date"]
+
+    # Top 15 merchants
+    spending: Counter[str] = Counter()
+    counts: Counter[str] = Counter()
+    for t in TRANSACTIONS:
+        if t["amount"] < 0:
+            m = extract_merchant(t["description"])
+            spending[m] += abs(t["amount"])
+            counts[m] += 1
+
+    top_merchants = "\n".join(
+        f"  - {m}: R{amt:,.2f} ({counts[m]} transactions)" for m, amt in spending.most_common(15)
+    )
+
+    # Monthly breakdown
+    monthly: dict[str, dict] = {}
+    for t in TRANSACTIONS:
+        month_key = t["date"][:7]  # "2024-02"
+        if month_key not in monthly:
+            monthly[month_key] = {"debits": 0.0, "credits": 0.0, "count": 0}
+        monthly[month_key]["count"] += 1
+        if t["amount"] < 0:
+            monthly[month_key]["debits"] += t["amount"]
+        else:
+            monthly[month_key]["credits"] += t["amount"]
+
+    month_lines = "\n".join(
+        f"  - {k}: spent R{abs(v['debits']):,.2f}, income R{v['credits']:,.2f} ({v['count']} txns)"
+        for k, v in sorted(monthly.items())
+    )
+
+    return (
+        f"You are a helpful financial assistant for a South African FNB bank account.\n"
+        f"Statement period: {first_date} to {last_date}\n"
+        f"Currency: South African Rand (ZAR), displayed as R.\n\n"
+        f"ACCOUNT SUMMARY:\n"
+        f"  Total spending (debits): R{abs(total_debits):,.2f} ({debit_count} transactions)\n"
+        f"  Total income (credits): R{total_credits:,.2f} ({credit_count} transactions)\n"
+        f"  Closing balance: R{closing_balance:,.2f}\n\n"
+        f"TOP MERCHANTS:\n{top_merchants}\n\n"
+        f"MONTHLY BREAKDOWN:\n{month_lines}\n\n"
+        f"Answer concisely. Use the data above to answer spending questions. "
+        f"If you don't have enough info, say so. Keep replies under 300 words."
+    )
+
+
+def ask_ollama(question: str) -> str:
+    """Send a question to llama3.2 via Ollama with the spending summary as context."""
+    try:
+        resp = http_requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "messages": [
+                    {"role": "system", "content": SPENDING_SUMMARY},
+                    {"role": "user", "content": question},
+                ],
+                "stream": False,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["message"]["content"]
+    except Exception:
+        return (
+            "Sorry, I couldn't process that right now. "
+            "Try a keyword like *total*, *uber*, *march*, or type *help*."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Merchant extraction
@@ -85,6 +173,9 @@ def extract_merchant(description: str) -> str:
     return description[:40]
 
 
+# Pre-compute the summary now that extract_merchant is defined
+SPENDING_SUMMARY = build_spending_summary()
+
 # ---------------------------------------------------------------------------
 # Month helpers
 # ---------------------------------------------------------------------------
@@ -144,6 +235,7 @@ def cmd_help() -> str:
         "- *top* - Top 10 merchants by spend\n"
         "- *february* / *march* / *april* / *may* - Monthly spending\n"
         "- *uber* / *bolt* / any merchant - Spending at that merchant\n"
+        "- Or just ask a question naturally!\n"
         "- *help* - Show this message"
     )
 
@@ -270,7 +362,13 @@ def handle_message(body: str) -> str:
         if keyword in text:
             return cmd_month_spending(month_num)
 
-    return cmd_merchant_search(text)
+    # Try merchant keyword search first
+    merchant_result = cmd_merchant_search(text)
+    if not merchant_result.startswith("No transactions found"):
+        return merchant_result
+
+    # Fallback: ask the LLM
+    return ask_ollama(body.strip())
 
 
 # ---------------------------------------------------------------------------
