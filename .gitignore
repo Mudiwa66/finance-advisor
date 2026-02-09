@@ -1,5 +1,8 @@
 # Sensitive financial data - NEVER commit
 data/
 
+# Virtual environment
+.venv/
+
 # macOS
 .DS_Store
