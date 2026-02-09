@@ -56,9 +56,7 @@ DESCRIPTION_PREFIXES = [
 
 CARD_RE = re.compile(r"\d{6}\*\d{4}")
 AMOUNT_PREFIX_RE = re.compile(r"^[\d,]+\.\d{2}\s+")
-TRAILING_DATE_RE = re.compile(
-    r"\s+\d{2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$"
-)
+TRAILING_DATE_RE = re.compile(r"\s+\d{2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$")
 TRAILING_NUMBERS_RE = re.compile(r"\s+\d{8,}$")
 
 
@@ -92,24 +90,44 @@ def extract_merchant(description: str) -> str:
 # ---------------------------------------------------------------------------
 
 MONTH_KEYWORDS = {
-    "january": "01", "jan": "01",
-    "february": "02", "feb": "02",
-    "march": "03", "mar": "03",
-    "april": "04", "apr": "04",
+    "january": "01",
+    "jan": "01",
+    "february": "02",
+    "feb": "02",
+    "march": "03",
+    "mar": "03",
+    "april": "04",
+    "apr": "04",
     "may": "05",
-    "june": "06", "jun": "06",
-    "july": "07", "jul": "07",
-    "august": "08", "aug": "08",
-    "september": "09", "sep": "09",
-    "october": "10", "oct": "10",
-    "november": "11", "nov": "11",
-    "december": "12", "dec": "12",
+    "june": "06",
+    "jun": "06",
+    "july": "07",
+    "jul": "07",
+    "august": "08",
+    "aug": "08",
+    "september": "09",
+    "sep": "09",
+    "october": "10",
+    "oct": "10",
+    "november": "11",
+    "nov": "11",
+    "december": "12",
+    "dec": "12",
 }
 
 MONTH_NAMES = {
-    "01": "January", "02": "February", "03": "March", "04": "April",
-    "05": "May", "06": "June", "07": "July", "08": "August",
-    "09": "September", "10": "October", "11": "November", "12": "December",
+    "01": "January",
+    "02": "February",
+    "03": "March",
+    "04": "April",
+    "05": "May",
+    "06": "June",
+    "07": "July",
+    "08": "August",
+    "09": "September",
+    "10": "October",
+    "11": "November",
+    "12": "December",
 }
 
 # ---------------------------------------------------------------------------
@@ -214,10 +232,7 @@ def cmd_merchant_search(query: str) -> str:
 
     if len(by_merchant) == 1:
         merchant_name = list(by_merchant.keys())[0]
-        return (
-            f"Spending at {merchant_name}: R{total:,.2f}\n"
-            f"({count} transactions, Feb-May 2024)"
-        )
+        return f"Spending at {merchant_name}: R{total:,.2f}\n({count} transactions, Feb-May 2024)"
 
     lines = [f'Spending matching "{query}": R{total:,.2f} total\n']
     for merchant, amt in by_merchant.most_common(10):
