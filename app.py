@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Flask webhook for answering spending questions via WhatsApp (Twilio)."""
 
+import hashlib
 import json
 import re
+import sqlite3
+import time
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests as http_requests
 from flask import Flask, request
+from markupsafe import escape
 from twilio.twiml.messaging_response import MessagingResponse
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
@@ -82,8 +87,9 @@ def build_spending_summary() -> str:
     )
 
 
-def ask_ollama(question: str) -> str:
-    """Send a question to llama3.2 via Ollama with the spending summary as context."""
+def ask_ollama(question: str) -> dict:
+    """Send a question to llama3.2 via Ollama. Returns dict with content, timing, tokens."""
+    start = time.monotonic()
     try:
         resp = http_requests.post(
             OLLAMA_URL,
@@ -98,12 +104,26 @@ def ask_ollama(question: str) -> str:
             timeout=30,
         )
         resp.raise_for_status()
-        return resp.json()["message"]["content"]
+        data = resp.json()
+        elapsed = time.monotonic() - start
+        tokens = data.get("eval_count", 0) + data.get("prompt_eval_count", 0)
+        return {
+            "content": data["message"]["content"],
+            "llm_time": round(elapsed, 3),
+            "tokens": tokens,
+            "error": False,
+        }
     except Exception:
-        return (
-            "Sorry, I couldn't process that right now. "
-            "Try a keyword like *total*, *uber*, *march*, or type *help*."
-        )
+        elapsed = time.monotonic() - start
+        return {
+            "content": (
+                "Sorry, I couldn't process that right now. "
+                "Try a keyword like *total*, *uber*, *march*, or type *help*."
+            ),
+            "llm_time": round(elapsed, 3),
+            "tokens": 0,
+            "error": True,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -339,36 +359,42 @@ def cmd_merchant_search(query: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def handle_message(body: str) -> str:
-    """Route an incoming message to the appropriate handler."""
+def _keyword_result(content: str) -> dict:
+    return {"content": content, "used_llm": False}
+
+
+def handle_message(body: str) -> dict:
+    """Route an incoming message to the appropriate handler. Returns a result dict."""
     text = body.strip().lower()
 
     if text in ("help", "commands", "menu", "hi", "hello", "?"):
-        return cmd_help()
+        return _keyword_result(cmd_help())
 
     if text in ("total spending", "total spend", "total debits", "total"):
-        return cmd_total_spending()
+        return _keyword_result(cmd_total_spending())
 
     if text in ("income", "credits", "total income", "salary", "total credits"):
-        return cmd_income()
+        return _keyword_result(cmd_income())
 
     if text in ("balance", "closing balance", "current balance"):
-        return cmd_balance()
+        return _keyword_result(cmd_balance())
 
     if text in ("top merchants", "top spend", "top", "biggest", "top 10"):
-        return cmd_top_merchants()
+        return _keyword_result(cmd_top_merchants())
 
     for keyword, month_num in MONTH_KEYWORDS.items():
         if keyword in text:
-            return cmd_month_spending(month_num)
+            return _keyword_result(cmd_month_spending(month_num))
 
     # Try merchant keyword search first
     merchant_result = cmd_merchant_search(text)
     if not merchant_result.startswith("No transactions found"):
-        return merchant_result
+        return {"content": merchant_result, "used_llm": False}
 
     # Fallback: ask the LLM
-    return ask_ollama(body.strip())
+    result = ask_ollama(body.strip())
+    result["used_llm"] = True
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -377,16 +403,252 @@ def handle_message(body: str) -> str:
 
 app = Flask(__name__)
 
+# ---------------------------------------------------------------------------
+# Metrics database
+# ---------------------------------------------------------------------------
+
+DB_PATH = Path(__file__).parent / "data" / "metrics.db"
+
+
+def _get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db() -> None:
+    conn = _get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            user_hash TEXT NOT NULL,
+            message_text TEXT NOT NULL,
+            used_llm INTEGER NOT NULL DEFAULT 0,
+            llm_response_time REAL,
+            total_response_time REAL NOT NULL,
+            success INTEGER NOT NULL DEFAULT 1,
+            tokens_used INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+_init_db()
+
+
+def _hash_user(phone: str) -> str:
+    return hashlib.sha256(phone.encode()).hexdigest()[:12]
+
+
+def _log_metric(
+    user_hash: str,
+    message_text: str,
+    used_llm: bool,
+    llm_time: float | None,
+    total_time: float,
+    success: bool,
+    tokens: int,
+) -> None:
+    conn = _get_db()
+    conn.execute(
+        """INSERT INTO metrics
+           (timestamp, user_hash, message_text, used_llm,
+            llm_response_time, total_response_time, success, tokens_used)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            datetime.now(timezone.utc).isoformat(),
+            user_hash,
+            message_text,
+            int(used_llm),
+            llm_time,
+            round(total_time, 3),
+            int(success),
+            tokens,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Webhook
+# ---------------------------------------------------------------------------
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """Receive incoming WhatsApp messages from Twilio and respond."""
+    start = time.monotonic()
     incoming_msg = request.form.get("Body", "").strip()
-    reply_text = handle_message(incoming_msg)
+    user_phone = request.form.get("From", "anonymous")
+    user_hash = _hash_user(user_phone)
+
+    result = handle_message(incoming_msg)
+    total_time = time.monotonic() - start
+
+    _log_metric(
+        user_hash=user_hash,
+        message_text=incoming_msg,
+        used_llm=result.get("used_llm", False),
+        llm_time=result.get("llm_time"),
+        total_time=total_time,
+        success=not result.get("error", False),
+        tokens=result.get("tokens", 0),
+    )
 
     resp = MessagingResponse()
-    resp.message(reply_text)
+    resp.message(result["content"])
     return str(resp), 200, {"Content-Type": "application/xml"}
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8"><title>Spending Bot Dashboard</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto;
+         padding: 0 1rem; background: #f8f9fa; color: #212529; }
+  h1 { border-bottom: 2px solid #dee2e6; padding-bottom: .5rem; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+           gap: 1rem; margin: 1.5rem 0; }
+  .card { background: #fff; border-radius: 8px; padding: 1.2rem;
+          box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+  .card .value { font-size: 1.8rem; font-weight: 700; color: #0d6efd; }
+  .card .label { font-size: .85rem; color: #6c757d; margin-top: .3rem; }
+  table { width: 100%%; border-collapse: collapse; background: #fff;
+          border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+  th, td { text-align: left; padding: .6rem .8rem; border-bottom: 1px solid #dee2e6; }
+  th { background: #e9ecef; font-size: .85rem; text-transform: uppercase; }
+  td { font-size: .9rem; }
+  .section { margin: 2rem 0; }
+  .bar { background: #0d6efd; height: 20px; border-radius: 3px; min-width: 2px; }
+  .bar-row { display: flex; align-items: center; gap: .5rem; margin: .3rem 0; }
+  .bar-label { font-size: .8rem; width: 80px; text-align: right; }
+  .bar-value { font-size: .8rem; color: #6c757d; }
+</style>
+</head><body>
+<h1>Spending Bot Dashboard</h1>
+
+<div class="cards">
+  <div class="card"><div class="value">%(today)s</div>
+    <div class="label">Messages today</div></div>
+  <div class="card"><div class="value">%(week)s</div>
+    <div class="label">Messages this week</div></div>
+  <div class="card"><div class="value">%(total)s</div>
+    <div class="label">Total messages</div></div>
+  <div class="card"><div class="value">%(avg_llm)s</div>
+    <div class="label">Avg LLM response (s)</div></div>
+  <div class="card"><div class="value">%(avg_total)s</div>
+    <div class="label">Avg total response (s)</div></div>
+  <div class="card"><div class="value">%(error_rate)s</div>
+    <div class="label">Error rate</div></div>
+</div>
+
+<div class="section">
+<h2>Messages per user</h2>
+<table><tr><th>User (hashed)</th><th>Messages</th><th>LLM queries</th></tr>
+%(user_rows)s
+</table></div>
+
+<div class="section">
+<h2>Common question patterns</h2>
+<table><tr><th>Message</th><th>Count</th></tr>
+%(pattern_rows)s
+</table></div>
+
+<div class="section">
+<h2>Messages over time (last 7 days)</h2>
+%(timeseries)s
+</div>
+
+</body></html>"""
+
+
+@app.route("/dashboard")
+def dashboard():
+    conn = _get_db()
+    now = datetime.now(timezone.utc)
+    today_str = now.strftime("%Y-%m-%d")
+    week_ago = (now - timedelta(days=7)).isoformat()
+
+    # Counts
+    today = conn.execute(
+        "SELECT COUNT(*) FROM metrics WHERE timestamp >= ?", (today_str,)
+    ).fetchone()[0]
+    week = conn.execute(
+        "SELECT COUNT(*) FROM metrics WHERE timestamp >= ?", (week_ago,)
+    ).fetchone()[0]
+    total = conn.execute("SELECT COUNT(*) FROM metrics").fetchone()[0]
+
+    # Averages
+    avg_row = conn.execute(
+        "SELECT AVG(llm_response_time), AVG(total_response_time) FROM metrics WHERE used_llm = 1"
+    ).fetchone()
+    avg_llm = f"{avg_row[0]:.2f}" if avg_row[0] else "-"
+    avg_total_row = conn.execute("SELECT AVG(total_response_time) FROM metrics").fetchone()
+    avg_total = f"{avg_total_row[0]:.2f}" if avg_total_row[0] else "-"
+
+    # Error rate
+    errors = conn.execute("SELECT COUNT(*) FROM metrics WHERE success = 0").fetchone()[0]
+    error_rate = f"{errors / total * 100:.1f}%" if total > 0 else "0%"
+
+    # Users
+    users = conn.execute(
+        "SELECT user_hash, COUNT(*) as cnt, SUM(used_llm) as llm_cnt "
+        "FROM metrics GROUP BY user_hash ORDER BY cnt DESC LIMIT 20"
+    ).fetchall()
+    user_rows = "".join(
+        f"<tr><td><code>{escape(r['user_hash'])}</code></td>"
+        f"<td>{r['cnt']}</td><td>{r['llm_cnt']}</td></tr>"
+        for r in users
+    )
+
+    # Patterns
+    patterns = conn.execute(
+        "SELECT LOWER(message_text) as msg, COUNT(*) as cnt "
+        "FROM metrics GROUP BY msg ORDER BY cnt DESC LIMIT 15"
+    ).fetchall()
+    pattern_rows = "".join(
+        f"<tr><td>{escape(r['msg'])}</td><td>{r['cnt']}</td></tr>" for r in patterns
+    )
+
+    # Time series (last 7 days, by day)
+    days = conn.execute(
+        "SELECT DATE(timestamp) as day, COUNT(*) as cnt "
+        "FROM metrics WHERE timestamp >= ? "
+        "GROUP BY day ORDER BY day",
+        (week_ago,),
+    ).fetchall()
+    max_cnt = max((r["cnt"] for r in days), default=1)
+    timeseries = "".join(
+        f'<div class="bar-row">'
+        f'<span class="bar-label">{r["day"][5:]}</span>'
+        f'<div class="bar" style="width:{r["cnt"] / max_cnt * 400}px"></div>'
+        f'<span class="bar-value">{r["cnt"]}</span></div>'
+        for r in days
+    )
+    if not timeseries:
+        timeseries = "<p>No data yet.</p>"
+
+    conn.close()
+
+    html = DASHBOARD_HTML % {
+        "today": today,
+        "week": week,
+        "total": total,
+        "avg_llm": avg_llm,
+        "avg_total": avg_total,
+        "error_rate": error_rate,
+        "user_rows": user_rows or "<tr><td colspan=3>No data yet</td></tr>",
+        "pattern_rows": pattern_rows or "<tr><td colspan=2>No data yet</td></tr>",
+        "timeseries": timeseries,
+    }
+    return html
 
 
 if __name__ == "__main__":
