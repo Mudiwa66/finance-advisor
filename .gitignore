@@ -1,6 +1,13 @@
 # Sensitive financial data - NEVER commit
 data/
 
+# Environment variables and credentials
+.env
+
+# Backup files from migration
+*.db.bak
+*.json.bak
+
 # Virtual environment
 .venv/
 

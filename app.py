@@ -3,29 +3,56 @@
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests as http_requests
+from dotenv import load_dotenv
 from flask import Flask, request
 from markupsafe import escape
+from supabase import create_client, Client
 from twilio.twiml.messaging_response import MessagingResponse
+
+load_dotenv()
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "llama3.2"
 
 # ---------------------------------------------------------------------------
-# Load transaction data once at startup
+# Supabase configuration
 # ---------------------------------------------------------------------------
 
-DATA_FILE = Path(__file__).parent / "data" / "transactions.json"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-with open(DATA_FILE) as f:
-    TRANSACTIONS: list[dict] = json.load(f)
+# ---------------------------------------------------------------------------
+# Load transaction data from Supabase
+# ---------------------------------------------------------------------------
+
+def _load_user_transactions(user_id: str) -> list[dict]:
+    """Load all transactions for a user from Supabase."""
+    try:
+        response = supabase.table("transactions") \
+            .select("date, description, amount, balance, merchant") \
+            .eq("user_id", user_id) \
+            .order("date") \
+            .execute()
+        return response.data
+    except Exception as e:
+        print(f"Error loading transactions: {e}")
+        return []
+
+# For backward compatibility, load default user's transactions at startup
+# TODO: Replace with actual user_id from migration script output
+DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "REPLACE_WITH_USER_ID_FROM_MIGRATION")
+TRANSACTIONS: list[dict] = _load_user_transactions(DEFAULT_USER_ID)
 
 # ---------------------------------------------------------------------------
 # Ollama LLM integration
@@ -404,38 +431,8 @@ def handle_message(body: str) -> dict:
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Metrics database
+# Metrics database (now using Supabase)
 # ---------------------------------------------------------------------------
-
-DB_PATH = Path(__file__).parent / "data" / "metrics.db"
-
-
-def _get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _init_db() -> None:
-    conn = _get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS metrics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            user_hash TEXT NOT NULL,
-            message_text TEXT NOT NULL,
-            used_llm INTEGER NOT NULL DEFAULT 0,
-            llm_response_time REAL,
-            total_response_time REAL NOT NULL,
-            success INTEGER NOT NULL DEFAULT 1,
-            tokens_used INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-_init_db()
 
 
 def _hash_user(phone: str) -> str:
@@ -451,25 +448,46 @@ def _log_metric(
     success: bool,
     tokens: int,
 ) -> None:
-    conn = _get_db()
-    conn.execute(
-        """INSERT INTO metrics
-           (timestamp, user_hash, message_text, used_llm,
-            llm_response_time, total_response_time, success, tokens_used)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            datetime.now(timezone.utc).isoformat(),
-            user_hash,
-            message_text,
-            int(used_llm),
-            llm_time,
-            round(total_time, 3),
-            int(success),
-            tokens,
-        ),
-    )
-    conn.commit()
-    conn.close()
+    """Log interaction metrics to Supabase."""
+    try:
+        # Get or create user
+        user_response = supabase.table("users") \
+            .select("id, total_messages") \
+            .eq("phone_hash", user_hash) \
+            .execute()
+
+        if user_response.data:
+            user_id = user_response.data[0]["id"]
+            current_total = user_response.data[0]["total_messages"]
+            # Update last_seen and increment message count
+            supabase.table("users") \
+                .update({
+                    "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                    "total_messages": current_total + 1
+                }) \
+                .eq("id", user_id) \
+                .execute()
+        else:
+            # Create new user
+            user_response = supabase.table("users") \
+                .insert({"phone_hash": user_hash, "total_messages": 1}) \
+                .execute()
+            user_id = user_response.data[0]["id"]
+
+        # Insert metric
+        supabase.table("metrics").insert({
+            "user_id": user_id,
+            "message_text": message_text,
+            "used_llm": used_llm,
+            "llm_response_time": llm_time,
+            "total_response_time": round(total_time, 3),
+            "success": success,
+            "tokens_used": tokens,
+        }).execute()
+
+    except Exception as e:
+        # Log error but don't fail the webhook response
+        print(f"Error logging metric: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +519,56 @@ def webhook():
     resp = MessagingResponse()
     resp.message(result["content"])
     return str(resp), 200, {"Content-Type": "application/xml"}
+
+
+# ---------------------------------------------------------------------------
+# PDF Upload Endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.route("/upload-statement", methods=["POST"])
+def upload_statement():
+    """Upload bank statement PDF to Supabase Storage."""
+    if "file" not in request.files:
+        return {"error": "No file provided"}, 400
+
+    file = request.files["file"]
+    user_hash = request.form.get("user_hash")
+
+    if not user_hash or not file.filename or not file.filename.endswith(".pdf"):
+        return {"error": "Invalid file or user_hash"}, 400
+
+    try:
+        # Validate user exists
+        user_response = supabase.table("users") \
+            .select("id") \
+            .eq("phone_hash", user_hash) \
+            .single() \
+            .execute()
+
+        if not user_response.data:
+            return {"error": "User not found"}, 404
+
+        user_id = user_response.data["id"]
+
+        # Upload to Supabase Storage
+        storage_path = f"{user_hash}/{file.filename}"
+        file_bytes = file.read()
+
+        supabase.storage.from_("bank-statements").upload(
+            path=storage_path,
+            file=file_bytes,
+            file_options={"content-type": "application/pdf"}
+        )
+
+        return {
+            "success": True,
+            "storage_path": storage_path,
+            "message": "PDF uploaded successfully. Process manually with parse_statement.py"
+        }, 200
+
+    except Exception as e:
+        return {"error": str(e)}, 500
 
 
 # ---------------------------------------------------------------------------
@@ -571,71 +639,143 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 @app.route("/dashboard")
 def dashboard():
-    conn = _get_db()
     now = datetime.now(timezone.utc)
     today_str = now.strftime("%Y-%m-%d")
     week_ago = (now - timedelta(days=7)).isoformat()
 
-    # Counts
-    today = conn.execute(
-        "SELECT COUNT(*) FROM metrics WHERE timestamp >= ?", (today_str,)
-    ).fetchone()[0]
-    week = conn.execute(
-        "SELECT COUNT(*) FROM metrics WHERE timestamp >= ?", (week_ago,)
-    ).fetchone()[0]
-    total = conn.execute("SELECT COUNT(*) FROM metrics").fetchone()[0]
+    try:
+        # Counts - today's messages
+        today_response = supabase.table("metrics") \
+            .select("*", count="exact") \
+            .gte("timestamp", today_str) \
+            .execute()
+        today = today_response.count
 
-    # Averages
-    avg_row = conn.execute(
-        "SELECT AVG(llm_response_time), AVG(total_response_time) FROM metrics WHERE used_llm = 1"
-    ).fetchone()
-    avg_llm = f"{avg_row[0]:.2f}" if avg_row[0] else "-"
-    avg_total_row = conn.execute("SELECT AVG(total_response_time) FROM metrics").fetchone()
-    avg_total = f"{avg_total_row[0]:.2f}" if avg_total_row[0] else "-"
+        # Count - this week
+        week_response = supabase.table("metrics") \
+            .select("*", count="exact") \
+            .gte("timestamp", week_ago) \
+            .execute()
+        week = week_response.count
 
-    # Error rate
-    errors = conn.execute("SELECT COUNT(*) FROM metrics WHERE success = 0").fetchone()[0]
-    error_rate = f"{errors / total * 100:.1f}%" if total > 0 else "0%"
+        # Count - total
+        total_response = supabase.table("metrics") \
+            .select("*", count="exact") \
+            .execute()
+        total = total_response.count
 
-    # Users
-    users = conn.execute(
-        "SELECT user_hash, COUNT(*) as cnt, SUM(used_llm) as llm_cnt "
-        "FROM metrics GROUP BY user_hash ORDER BY cnt DESC LIMIT 20"
-    ).fetchall()
-    user_rows = "".join(
-        f"<tr><td><code>{escape(r['user_hash'])}</code></td>"
-        f"<td>{r['cnt']}</td><td>{r['llm_cnt']}</td></tr>"
-        for r in users
-    )
+        # Averages - fetch all metrics with LLM for client-side aggregation
+        metrics_with_llm = supabase.table("metrics") \
+            .select("llm_response_time") \
+            .eq("used_llm", True) \
+            .not_.is_("llm_response_time", "null") \
+            .execute()
 
-    # Patterns
-    patterns = conn.execute(
-        "SELECT LOWER(message_text) as msg, COUNT(*) as cnt "
-        "FROM metrics GROUP BY msg ORDER BY cnt DESC LIMIT 15"
-    ).fetchall()
-    pattern_rows = "".join(
-        f"<tr><td>{escape(r['msg'])}</td><td>{r['cnt']}</td></tr>" for r in patterns
-    )
+        if metrics_with_llm.data:
+            avg_llm_value = sum(m["llm_response_time"] for m in metrics_with_llm.data) / len(metrics_with_llm.data)
+            avg_llm = f"{avg_llm_value:.2f}"
+        else:
+            avg_llm = "-"
 
-    # Time series (last 7 days, by day)
-    days = conn.execute(
-        "SELECT DATE(timestamp) as day, COUNT(*) as cnt "
-        "FROM metrics WHERE timestamp >= ? "
-        "GROUP BY day ORDER BY day",
-        (week_ago,),
-    ).fetchall()
-    max_cnt = max((r["cnt"] for r in days), default=1)
-    timeseries = "".join(
-        f'<div class="bar-row">'
-        f'<span class="bar-label">{r["day"][5:]}</span>'
-        f'<div class="bar" style="width:{r["cnt"] / max_cnt * 400}px"></div>'
-        f'<span class="bar-value">{r["cnt"]}</span></div>'
-        for r in days
-    )
-    if not timeseries:
-        timeseries = "<p>No data yet.</p>"
+        # Average total response time
+        all_metrics = supabase.table("metrics") \
+            .select("total_response_time") \
+            .execute()
 
-    conn.close()
+        if all_metrics.data:
+            avg_total_value = sum(m["total_response_time"] for m in all_metrics.data) / len(all_metrics.data)
+            avg_total = f"{avg_total_value:.2f}"
+        else:
+            avg_total = "-"
+
+        # Error rate
+        errors_response = supabase.table("metrics") \
+            .select("*", count="exact") \
+            .eq("success", False) \
+            .execute()
+        errors = errors_response.count
+        error_rate = f"{errors / total * 100:.1f}%" if total > 0 else "0%"
+
+        # Users - fetch all metrics and group client-side
+        all_metrics_for_users = supabase.table("metrics") \
+            .select("user_id, used_llm") \
+            .execute()
+
+        user_stats = defaultdict(lambda: {"cnt": 0, "llm_cnt": 0})
+        for m in all_metrics_for_users.data:
+            user_stats[m["user_id"]]["cnt"] += 1
+            user_stats[m["user_id"]]["llm_cnt"] += (1 if m["used_llm"] else 0)
+
+        # Get user phone_hashes for top 20 users
+        top_user_ids = sorted(user_stats.keys(), key=lambda uid: user_stats[uid]["cnt"], reverse=True)[:20]
+
+        if top_user_ids:
+            users_data = supabase.table("users") \
+                .select("id, phone_hash") \
+                .in_("id", top_user_ids) \
+                .execute()
+
+            # Create lookup dict
+            user_hash_map = {u["id"]: u["phone_hash"] for u in users_data.data}
+
+            # Format for template
+            users = [
+                {
+                    "user_hash": user_hash_map.get(uid, "unknown"),
+                    "cnt": user_stats[uid]["cnt"],
+                    "llm_cnt": user_stats[uid]["llm_cnt"]
+                }
+                for uid in top_user_ids
+            ]
+        else:
+            users = []
+
+        user_rows = "".join(
+            f"<tr><td><code>{escape(u['user_hash'])}</code></td>"
+            f"<td>{u['cnt']}</td><td>{u['llm_cnt']}</td></tr>"
+            for u in users
+        )
+
+        # Patterns - fetch all message texts and group client-side
+        all_messages = supabase.table("metrics") \
+            .select("message_text") \
+            .execute()
+
+        pattern_counter = defaultdict(int)
+        for m in all_messages.data:
+            pattern_counter[m["message_text"].lower()] += 1
+
+        patterns = sorted(pattern_counter.items(), key=lambda x: x[1], reverse=True)[:15]
+        pattern_rows = "".join(
+            f"<tr><td>{escape(msg)}</td><td>{cnt}</td></tr>" for msg, cnt in patterns
+        )
+
+        # Time series - fetch metrics from last 7 days and group by day
+        week_metrics = supabase.table("metrics") \
+            .select("timestamp") \
+            .gte("timestamp", week_ago) \
+            .execute()
+
+        day_counter = defaultdict(int)
+        for m in week_metrics.data:
+            day = m["timestamp"][:10]  # Extract YYYY-MM-DD
+            day_counter[day] += 1
+
+        days = sorted(day_counter.items())
+        max_cnt = max((cnt for _, cnt in days), default=1)
+        timeseries = "".join(
+            f'<div class="bar-row">'
+            f'<span class="bar-label">{day[5:]}</span>'
+            f'<div class="bar" style="width:{cnt / max_cnt * 400}px"></div>'
+            f'<span class="bar-value">{cnt}</span></div>'
+            for day, cnt in days
+        )
+        if not timeseries:
+            timeseries = "<p>No data yet.</p>"
+
+    except Exception as e:
+        print(f"Error fetching dashboard data: {e}", file=sys.stderr)
+        return f"<html><body><h1>Error loading dashboard</h1><p>{escape(str(e))}</p></body></html>", 500
 
     html = DASHBOARD_HTML % {
         "today": today,
