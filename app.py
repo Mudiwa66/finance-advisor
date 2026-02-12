@@ -18,8 +18,8 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 load_dotenv()
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "llama3.2"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 
 # ---------------------------------------------------------------------------
 # Supabase configuration
@@ -795,4 +795,6 @@ def dashboard():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5001)
+    port = int(os.getenv("PORT", 5001))
+    debug = os.getenv("FLASK_DEBUG", "False").lower() == "true"
+    app.run(debug=debug, host="0.0.0.0", port=port)
