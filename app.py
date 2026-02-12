@@ -33,18 +33,22 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Load transaction data from Supabase
 # ---------------------------------------------------------------------------
 
+
 def _load_user_transactions(user_id: str) -> list[dict]:
     """Load all transactions for a user from Supabase."""
     try:
-        response = supabase.table("transactions") \
-            .select("date, description, amount, balance, merchant") \
-            .eq("user_id", user_id) \
-            .order("date") \
+        response = (
+            supabase.table("transactions")
+            .select("date, description, amount, balance, merchant")
+            .eq("user_id", user_id)
+            .order("date")
             .execute()
+        )
         return response.data
     except Exception as e:
         print(f"Error loading transactions: {e}")
         return []
+
 
 # For backward compatibility, load default user's transactions at startup
 # TODO: Replace with actual user_id from migration script output
@@ -448,39 +452,44 @@ def _log_metric(
     """Log interaction metrics to Supabase."""
     try:
         # Get or create user
-        user_response = supabase.table("users") \
-            .select("id, total_messages") \
-            .eq("phone_hash", user_hash) \
+        user_response = (
+            supabase.table("users")
+            .select("id, total_messages")
+            .eq("phone_hash", user_hash)
             .execute()
+        )
 
         if user_response.data:
             user_id = user_response.data[0]["id"]
             current_total = user_response.data[0]["total_messages"]
             # Update last_seen and increment message count
-            supabase.table("users") \
-                .update({
+            supabase.table("users").update(
+                {
                     "last_seen_at": datetime.now(timezone.utc).isoformat(),
-                    "total_messages": current_total + 1
-                }) \
-                .eq("id", user_id) \
-                .execute()
+                    "total_messages": current_total + 1,
+                }
+            ).eq("id", user_id).execute()
         else:
             # Create new user
-            user_response = supabase.table("users") \
-                .insert({"phone_hash": user_hash, "total_messages": 1}) \
+            user_response = (
+                supabase.table("users")
+                .insert({"phone_hash": user_hash, "total_messages": 1})
                 .execute()
+            )
             user_id = user_response.data[0]["id"]
 
         # Insert metric
-        supabase.table("metrics").insert({
-            "user_id": user_id,
-            "message_text": message_text,
-            "used_llm": used_llm,
-            "llm_response_time": llm_time,
-            "total_response_time": round(total_time, 3),
-            "success": success,
-            "tokens_used": tokens,
-        }).execute()
+        supabase.table("metrics").insert(
+            {
+                "user_id": user_id,
+                "message_text": message_text,
+                "used_llm": used_llm,
+                "llm_response_time": llm_time,
+                "total_response_time": round(total_time, 3),
+                "success": success,
+                "tokens_used": tokens,
+            }
+        ).execute()
 
     except Exception as e:
         # Log error but don't fail the webhook response
@@ -537,11 +546,9 @@ def upload_statement():
 
     try:
         # Validate user exists
-        user_response = supabase.table("users") \
-            .select("id") \
-            .eq("phone_hash", user_hash) \
-            .single() \
-            .execute()
+        user_response = (
+            supabase.table("users").select("id").eq("phone_hash", user_hash).single().execute()
+        )
 
         if not user_response.data:
             return {"error": "User not found"}, 404
@@ -551,15 +558,13 @@ def upload_statement():
         file_bytes = file.read()
 
         supabase.storage.from_("bank-statements").upload(
-            path=storage_path,
-            file=file_bytes,
-            file_options={"content-type": "application/pdf"}
+            path=storage_path, file=file_bytes, file_options={"content-type": "application/pdf"}
         )
 
         return {
             "success": True,
             "storage_path": storage_path,
-            "message": "PDF uploaded successfully. Process manually with parse_statement.py"
+            "message": "PDF uploaded successfully. Process manually with parse_statement.py",
         }, 200
 
     except Exception as e:
@@ -640,31 +645,35 @@ def dashboard():
 
     try:
         # Counts - today's messages
-        today_response = supabase.table("metrics") \
-            .select("*", count="exact") \
-            .gte("timestamp", today_str) \
+        today_response = (
+            supabase.table("metrics")
+            .select("*", count="exact")
+            .gte("timestamp", today_str)
             .execute()
+        )
         today = today_response.count
 
         # Count - this week
-        week_response = supabase.table("metrics") \
-            .select("*", count="exact") \
-            .gte("timestamp", week_ago) \
+        week_response = (
+            supabase.table("metrics")
+            .select("*", count="exact")
+            .gte("timestamp", week_ago)
             .execute()
+        )
         week = week_response.count
 
         # Count - total
-        total_response = supabase.table("metrics") \
-            .select("*", count="exact") \
-            .execute()
+        total_response = supabase.table("metrics").select("*", count="exact").execute()
         total = total_response.count
 
         # Averages - fetch all metrics with LLM for client-side aggregation
-        metrics_with_llm = supabase.table("metrics") \
-            .select("llm_response_time") \
-            .eq("used_llm", True) \
-            .not_.is_("llm_response_time", "null") \
+        metrics_with_llm = (
+            supabase.table("metrics")
+            .select("llm_response_time")
+            .eq("used_llm", True)
+            .not_.is_("llm_response_time", "null")
             .execute()
+        )
 
         if metrics_with_llm.data:
             llm_times = [m["llm_response_time"] for m in metrics_with_llm.data]
@@ -674,9 +683,7 @@ def dashboard():
             avg_llm = "-"
 
         # Average total response time
-        all_metrics = supabase.table("metrics") \
-            .select("total_response_time") \
-            .execute()
+        all_metrics = supabase.table("metrics").select("total_response_time").execute()
 
         if all_metrics.data:
             total_times = [m["total_response_time"] for m in all_metrics.data]
@@ -686,22 +693,19 @@ def dashboard():
             avg_total = "-"
 
         # Error rate
-        errors_response = supabase.table("metrics") \
-            .select("*", count="exact") \
-            .eq("success", False) \
-            .execute()
+        errors_response = (
+            supabase.table("metrics").select("*", count="exact").eq("success", False).execute()
+        )
         errors = errors_response.count
         error_rate = f"{errors / total * 100:.1f}%" if total > 0 else "0%"
 
         # Users - fetch all metrics and group client-side
-        all_metrics_for_users = supabase.table("metrics") \
-            .select("user_id, used_llm") \
-            .execute()
+        all_metrics_for_users = supabase.table("metrics").select("user_id, used_llm").execute()
 
         user_stats = defaultdict(lambda: {"cnt": 0, "llm_cnt": 0})
         for m in all_metrics_for_users.data:
             user_stats[m["user_id"]]["cnt"] += 1
-            user_stats[m["user_id"]]["llm_cnt"] += (1 if m["used_llm"] else 0)
+            user_stats[m["user_id"]]["llm_cnt"] += 1 if m["used_llm"] else 0
 
         # Get user phone_hashes for top 20 users
         sorted_users = sorted(
@@ -710,10 +714,9 @@ def dashboard():
         top_user_ids = sorted_users[:20]
 
         if top_user_ids:
-            users_data = supabase.table("users") \
-                .select("id, phone_hash") \
-                .in_("id", top_user_ids) \
-                .execute()
+            users_data = (
+                supabase.table("users").select("id, phone_hash").in_("id", top_user_ids).execute()
+            )
 
             # Create lookup dict
             user_hash_map = {u["id"]: u["phone_hash"] for u in users_data.data}
@@ -723,7 +726,7 @@ def dashboard():
                 {
                     "user_hash": user_hash_map.get(uid, "unknown"),
                     "cnt": user_stats[uid]["cnt"],
-                    "llm_cnt": user_stats[uid]["llm_cnt"]
+                    "llm_cnt": user_stats[uid]["llm_cnt"],
                 }
                 for uid in top_user_ids
             ]
@@ -737,9 +740,7 @@ def dashboard():
         )
 
         # Patterns - fetch all message texts and group client-side
-        all_messages = supabase.table("metrics") \
-            .select("message_text") \
-            .execute()
+        all_messages = supabase.table("metrics").select("message_text").execute()
 
         pattern_counter = defaultdict(int)
         for m in all_messages.data:
@@ -751,10 +752,9 @@ def dashboard():
         )
 
         # Time series - fetch metrics from last 7 days and group by day
-        week_metrics = supabase.table("metrics") \
-            .select("timestamp") \
-            .gte("timestamp", week_ago) \
-            .execute()
+        week_metrics = (
+            supabase.table("metrics").select("timestamp").gte("timestamp", week_ago).execute()
+        )
 
         day_counter = defaultdict(int)
         for m in week_metrics.data:
@@ -776,8 +776,7 @@ def dashboard():
     except Exception as e:
         print(f"Error fetching dashboard data: {e}", file=sys.stderr)
         return (
-            f"<html><body><h1>Error loading dashboard</h1>"
-            f"<p>{escape(str(e))}</p></body></html>",
+            f"<html><body><h1>Error loading dashboard</h1><p>{escape(str(e))}</p></body></html>",
             500,
         )
 

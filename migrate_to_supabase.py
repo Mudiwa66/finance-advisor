@@ -56,6 +56,7 @@ def extract_merchant(description: str) -> str:
         return matched_prefix
     return description[:40]
 
+
 def migrate():
     print("🚀 Starting Supabase migration...")
 
@@ -83,12 +84,14 @@ def migrate():
         default_hash = metrics[0]["user_hash"]
     else:
         import hashlib
+
         default_hash = hashlib.sha256("default_user".encode()).hexdigest()[:12]
 
-    user_response = supabase.table("users").insert({
-        "phone_hash": default_hash,
-        "total_messages": len(metrics)
-    }).execute()
+    user_response = (
+        supabase.table("users")
+        .insert({"phone_hash": default_hash, "total_messages": len(metrics)})
+        .execute()
+    )
     user_id = user_response.data[0]["id"]
     print(f"  ✓ Created user with hash {default_hash}, ID: {user_id}")
 
@@ -101,37 +104,43 @@ def migrate():
         if float(txn.get("amount", 0)) < 0:
             merchant = extract_merchant(txn.get("description", ""))
 
-        enriched_transactions.append({
-            "user_id": user_id,
-            "date": txn["date"],
-            "description": txn.get("description", ""),
-            "amount": txn["amount"],
-            "balance": txn["balance"],
-            "merchant": merchant,
-            "statement_source": "FNB_ASPIRE_CURRENT_ACCOUNT_27.pdf"
-        })
+        enriched_transactions.append(
+            {
+                "user_id": user_id,
+                "date": txn["date"],
+                "description": txn.get("description", ""),
+                "amount": txn["amount"],
+                "balance": txn["balance"],
+                "merchant": merchant,
+                "statement_source": "FNB_ASPIRE_CURRENT_ACCOUNT_27.pdf",
+            }
+        )
 
     # Bulk insert transactions
     batch_size = 100
     for i in range(0, len(enriched_transactions), batch_size):
-        batch = enriched_transactions[i:i+batch_size]
+        batch = enriched_transactions[i : i + batch_size]
         supabase.table("transactions").insert(batch).execute()
-        print(f"  ✓ Inserted transactions {i+1}-{min(i+batch_size, len(enriched_transactions))}")
+        print(
+            f"  ✓ Inserted transactions {i + 1}-{min(i + batch_size, len(enriched_transactions))}"
+        )
 
     # Step 4: Migrate metrics
     print("\n📈 Migrating metrics...")
     migrated_metrics = []
     for m in metrics:
-        migrated_metrics.append({
-            "user_id": user_id,
-            "timestamp": m["timestamp"],
-            "message_text": m["message_text"],
-            "used_llm": bool(m["used_llm"]),
-            "llm_response_time": m["llm_response_time"],
-            "total_response_time": m["total_response_time"],
-            "success": bool(m["success"]),
-            "tokens_used": m["tokens_used"]
-        })
+        migrated_metrics.append(
+            {
+                "user_id": user_id,
+                "timestamp": m["timestamp"],
+                "message_text": m["message_text"],
+                "used_llm": bool(m["used_llm"]),
+                "llm_response_time": m["llm_response_time"],
+                "total_response_time": m["total_response_time"],
+                "success": bool(m["success"]),
+                "tokens_used": m["tokens_used"],
+            }
+        )
 
     if migrated_metrics:
         supabase.table("metrics").insert(migrated_metrics).execute()
@@ -153,6 +162,7 @@ def migrate():
         # Backup old files
         print("\n💾 Backing up old data files...")
         import shutil
+
         shutil.copy(metrics_db, metrics_db.with_suffix(".db.bak"))
         shutil.copy(transactions_file, transactions_file.with_suffix(".json.bak"))
         print("  ✓ Backed up metrics.db → metrics.db.bak")
@@ -163,6 +173,7 @@ def migrate():
     conn.close()
     print(f"\n📝 Save this user_id for configuration: {user_id}")
     print(f"📝 Save this phone_hash for configuration: {default_hash}")
+
 
 if __name__ == "__main__":
     migrate()
