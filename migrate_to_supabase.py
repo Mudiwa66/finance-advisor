@@ -2,12 +2,13 @@
 """Migrate SQLite metrics and JSON transactions to Supabase."""
 
 import json
+import os
 import re
 import sqlite3
 from pathlib import Path
-from supabase import create_client
+
 from dotenv import load_dotenv
-import os
+from supabase import create_client
 
 load_dotenv()
 

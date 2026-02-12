@@ -2,21 +2,18 @@
 """Flask webhook for answering spending questions via WhatsApp (Twilio)."""
 
 import hashlib
-import json
 import os
 import re
-import sqlite3
 import sys
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import requests as http_requests
 from dotenv import load_dotenv
 from flask import Flask, request
 from markupsafe import escape
-from supabase import create_client, Client
+from supabase import Client, create_client
 from twilio.twiml.messaging_response import MessagingResponse
 
 load_dotenv()
@@ -670,7 +667,8 @@ def dashboard():
             .execute()
 
         if metrics_with_llm.data:
-            avg_llm_value = sum(m["llm_response_time"] for m in metrics_with_llm.data) / len(metrics_with_llm.data)
+            llm_times = [m["llm_response_time"] for m in metrics_with_llm.data]
+            avg_llm_value = sum(llm_times) / len(llm_times)
             avg_llm = f"{avg_llm_value:.2f}"
         else:
             avg_llm = "-"
@@ -681,7 +679,8 @@ def dashboard():
             .execute()
 
         if all_metrics.data:
-            avg_total_value = sum(m["total_response_time"] for m in all_metrics.data) / len(all_metrics.data)
+            total_times = [m["total_response_time"] for m in all_metrics.data]
+            avg_total_value = sum(total_times) / len(total_times)
             avg_total = f"{avg_total_value:.2f}"
         else:
             avg_total = "-"
@@ -705,7 +704,10 @@ def dashboard():
             user_stats[m["user_id"]]["llm_cnt"] += (1 if m["used_llm"] else 0)
 
         # Get user phone_hashes for top 20 users
-        top_user_ids = sorted(user_stats.keys(), key=lambda uid: user_stats[uid]["cnt"], reverse=True)[:20]
+        sorted_users = sorted(
+            user_stats.keys(), key=lambda uid: user_stats[uid]["cnt"], reverse=True
+        )
+        top_user_ids = sorted_users[:20]
 
         if top_user_ids:
             users_data = supabase.table("users") \
