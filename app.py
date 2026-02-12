@@ -549,8 +549,6 @@ def upload_statement():
         if not user_response.data:
             return {"error": "User not found"}, 404
 
-        user_id = user_response.data["id"]
-
         # Upload to Supabase Storage
         storage_path = f"{user_hash}/{file.filename}"
         file_bytes = file.read()
@@ -775,7 +773,11 @@ def dashboard():
 
     except Exception as e:
         print(f"Error fetching dashboard data: {e}", file=sys.stderr)
-        return f"<html><body><h1>Error loading dashboard</h1><p>{escape(str(e))}</p></body></html>", 500
+        return (
+            f"<html><body><h1>Error loading dashboard</h1>"
+            f"<p>{escape(str(e))}</p></body></html>",
+            500,
+        )
 
     html = DASHBOARD_HTML % {
         "today": today,
