@@ -2,12 +2,12 @@
 """Migrate SQLite metrics and JSON transactions to Supabase."""
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 from supabase import create_client
 from dotenv import load_dotenv
 import os
-import sys
 
 load_dotenv()
 
@@ -15,9 +15,45 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Import merchant extraction logic
-sys.path.insert(0, str(Path(__file__).parent))
-from app import extract_merchant
+# Merchant extraction logic (copied from app.py to avoid circular imports)
+DESCRIPTION_PREFIXES = [
+    "Card Purchase",
+    "FNB OB Pmt",
+    "Payment To",
+    "Rtc Credit",
+    "Byc Debit",
+    "ATM Cash",
+]
+
+CARD_RE = re.compile(r"\d{6}\*\d{4}")
+AMOUNT_PREFIX_RE = re.compile(r"^[\d,]+\.\d{2}\s+")
+TRAILING_DATE_RE = re.compile(r"\s+\d{2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$")
+TRAILING_NUMBERS_RE = re.compile(r"\s+\d{8,}$")
+
+
+def extract_merchant(description: str) -> str:
+    """Extract a human-readable merchant/payee name from a transaction description."""
+    if not description.strip():
+        return "Bank Fees"
+
+    text = description
+    matched_prefix = None
+    for prefix in DESCRIPTION_PREFIXES:
+        if text.startswith(prefix):
+            matched_prefix = prefix
+            text = text[len(prefix) :].strip()
+            break
+
+    text = CARD_RE.split(text)[0].strip()
+    text = AMOUNT_PREFIX_RE.sub("", text)
+    text = TRAILING_DATE_RE.sub("", text)
+    text = TRAILING_NUMBERS_RE.sub("", text).strip()
+
+    if text:
+        return text
+    if matched_prefix:
+        return matched_prefix
+    return description[:40]
 
 def migrate():
     print("🚀 Starting Supabase migration...")
