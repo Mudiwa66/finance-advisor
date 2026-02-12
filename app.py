@@ -1,26 +1,59 @@
 #!/usr/bin/env python3
 """Flask webhook for answering spending questions via WhatsApp (Twilio)."""
 
-import json
+import hashlib
+import os
 import re
-from collections import Counter
-from pathlib import Path
+import sys
+import time
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
 
 import requests as http_requests
+from dotenv import load_dotenv
 from flask import Flask, request
+from markupsafe import escape
+from supabase import Client, create_client
 from twilio.twiml.messaging_response import MessagingResponse
+
+load_dotenv()
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "llama3.2"
 
 # ---------------------------------------------------------------------------
-# Load transaction data once at startup
+# Supabase configuration
 # ---------------------------------------------------------------------------
 
-DATA_FILE = Path(__file__).parent / "data" / "transactions.json"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-with open(DATA_FILE) as f:
-    TRANSACTIONS: list[dict] = json.load(f)
+# ---------------------------------------------------------------------------
+# Load transaction data from Supabase
+# ---------------------------------------------------------------------------
+
+
+def _load_user_transactions(user_id: str) -> list[dict]:
+    """Load all transactions for a user from Supabase."""
+    try:
+        response = (
+            supabase.table("transactions")
+            .select("date, description, amount, balance, merchant")
+            .eq("user_id", user_id)
+            .order("date")
+            .execute()
+        )
+        return response.data
+    except Exception as e:
+        print(f"Error loading transactions: {e}")
+        return []
+
+
+# For backward compatibility, load default user's transactions at startup
+# TODO: Replace with actual user_id from migration script output
+DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "REPLACE_WITH_USER_ID_FROM_MIGRATION")
+TRANSACTIONS: list[dict] = _load_user_transactions(DEFAULT_USER_ID)
 
 # ---------------------------------------------------------------------------
 # Ollama LLM integration
@@ -82,8 +115,9 @@ def build_spending_summary() -> str:
     )
 
 
-def ask_ollama(question: str) -> str:
-    """Send a question to llama3.2 via Ollama with the spending summary as context."""
+def ask_ollama(question: str) -> dict:
+    """Send a question to llama3.2 via Ollama. Returns dict with content, timing, tokens."""
+    start = time.monotonic()
     try:
         resp = http_requests.post(
             OLLAMA_URL,
@@ -98,12 +132,26 @@ def ask_ollama(question: str) -> str:
             timeout=30,
         )
         resp.raise_for_status()
-        return resp.json()["message"]["content"]
+        data = resp.json()
+        elapsed = time.monotonic() - start
+        tokens = data.get("eval_count", 0) + data.get("prompt_eval_count", 0)
+        return {
+            "content": data["message"]["content"],
+            "llm_time": round(elapsed, 3),
+            "tokens": tokens,
+            "error": False,
+        }
     except Exception:
-        return (
-            "Sorry, I couldn't process that right now. "
-            "Try a keyword like *total*, *uber*, *march*, or type *help*."
-        )
+        elapsed = time.monotonic() - start
+        return {
+            "content": (
+                "Sorry, I couldn't process that right now. "
+                "Try a keyword like *total*, *uber*, *march*, or type *help*."
+            ),
+            "llm_time": round(elapsed, 3),
+            "tokens": 0,
+            "error": True,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -339,36 +387,42 @@ def cmd_merchant_search(query: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def handle_message(body: str) -> str:
-    """Route an incoming message to the appropriate handler."""
+def _keyword_result(content: str) -> dict:
+    return {"content": content, "used_llm": False}
+
+
+def handle_message(body: str) -> dict:
+    """Route an incoming message to the appropriate handler. Returns a result dict."""
     text = body.strip().lower()
 
     if text in ("help", "commands", "menu", "hi", "hello", "?"):
-        return cmd_help()
+        return _keyword_result(cmd_help())
 
     if text in ("total spending", "total spend", "total debits", "total"):
-        return cmd_total_spending()
+        return _keyword_result(cmd_total_spending())
 
     if text in ("income", "credits", "total income", "salary", "total credits"):
-        return cmd_income()
+        return _keyword_result(cmd_income())
 
     if text in ("balance", "closing balance", "current balance"):
-        return cmd_balance()
+        return _keyword_result(cmd_balance())
 
     if text in ("top merchants", "top spend", "top", "biggest", "top 10"):
-        return cmd_top_merchants()
+        return _keyword_result(cmd_top_merchants())
 
     for keyword, month_num in MONTH_KEYWORDS.items():
         if keyword in text:
-            return cmd_month_spending(month_num)
+            return _keyword_result(cmd_month_spending(month_num))
 
     # Try merchant keyword search first
     merchant_result = cmd_merchant_search(text)
     if not merchant_result.startswith("No transactions found"):
-        return merchant_result
+        return {"content": merchant_result, "used_llm": False}
 
     # Fallback: ask the LLM
-    return ask_ollama(body.strip())
+    result = ask_ollama(body.strip())
+    result["used_llm"] = True
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -377,16 +431,367 @@ def handle_message(body: str) -> str:
 
 app = Flask(__name__)
 
+# ---------------------------------------------------------------------------
+# Metrics database (now using Supabase)
+# ---------------------------------------------------------------------------
+
+
+def _hash_user(phone: str) -> str:
+    return hashlib.sha256(phone.encode()).hexdigest()[:12]
+
+
+def _log_metric(
+    user_hash: str,
+    message_text: str,
+    used_llm: bool,
+    llm_time: float | None,
+    total_time: float,
+    success: bool,
+    tokens: int,
+) -> None:
+    """Log interaction metrics to Supabase."""
+    try:
+        # Get or create user
+        user_response = (
+            supabase.table("users")
+            .select("id, total_messages")
+            .eq("phone_hash", user_hash)
+            .execute()
+        )
+
+        if user_response.data:
+            user_id = user_response.data[0]["id"]
+            current_total = user_response.data[0]["total_messages"]
+            # Update last_seen and increment message count
+            supabase.table("users").update(
+                {
+                    "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                    "total_messages": current_total + 1,
+                }
+            ).eq("id", user_id).execute()
+        else:
+            # Create new user
+            user_response = (
+                supabase.table("users")
+                .insert({"phone_hash": user_hash, "total_messages": 1})
+                .execute()
+            )
+            user_id = user_response.data[0]["id"]
+
+        # Insert metric
+        supabase.table("metrics").insert(
+            {
+                "user_id": user_id,
+                "message_text": message_text,
+                "used_llm": used_llm,
+                "llm_response_time": llm_time,
+                "total_response_time": round(total_time, 3),
+                "success": success,
+                "tokens_used": tokens,
+            }
+        ).execute()
+
+    except Exception as e:
+        # Log error but don't fail the webhook response
+        print(f"Error logging metric: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Webhook
+# ---------------------------------------------------------------------------
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """Receive incoming WhatsApp messages from Twilio and respond."""
+    start = time.monotonic()
     incoming_msg = request.form.get("Body", "").strip()
-    reply_text = handle_message(incoming_msg)
+    user_phone = request.form.get("From", "anonymous")
+    user_hash = _hash_user(user_phone)
+
+    result = handle_message(incoming_msg)
+    total_time = time.monotonic() - start
+
+    _log_metric(
+        user_hash=user_hash,
+        message_text=incoming_msg,
+        used_llm=result.get("used_llm", False),
+        llm_time=result.get("llm_time"),
+        total_time=total_time,
+        success=not result.get("error", False),
+        tokens=result.get("tokens", 0),
+    )
 
     resp = MessagingResponse()
-    resp.message(reply_text)
+    resp.message(result["content"])
     return str(resp), 200, {"Content-Type": "application/xml"}
+
+
+# ---------------------------------------------------------------------------
+# PDF Upload Endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.route("/upload-statement", methods=["POST"])
+def upload_statement():
+    """Upload bank statement PDF to Supabase Storage."""
+    if "file" not in request.files:
+        return {"error": "No file provided"}, 400
+
+    file = request.files["file"]
+    user_hash = request.form.get("user_hash")
+
+    if not user_hash or not file.filename or not file.filename.endswith(".pdf"):
+        return {"error": "Invalid file or user_hash"}, 400
+
+    try:
+        # Validate user exists
+        user_response = (
+            supabase.table("users").select("id").eq("phone_hash", user_hash).single().execute()
+        )
+
+        if not user_response.data:
+            return {"error": "User not found"}, 404
+
+        # Upload to Supabase Storage
+        storage_path = f"{user_hash}/{file.filename}"
+        file_bytes = file.read()
+
+        supabase.storage.from_("bank-statements").upload(
+            path=storage_path, file=file_bytes, file_options={"content-type": "application/pdf"}
+        )
+
+        return {
+            "success": True,
+            "storage_path": storage_path,
+            "message": "PDF uploaded successfully. Process manually with parse_statement.py",
+        }, 200
+
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8"><title>Spending Bot Dashboard</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto;
+         padding: 0 1rem; background: #f8f9fa; color: #212529; }
+  h1 { border-bottom: 2px solid #dee2e6; padding-bottom: .5rem; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+           gap: 1rem; margin: 1.5rem 0; }
+  .card { background: #fff; border-radius: 8px; padding: 1.2rem;
+          box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+  .card .value { font-size: 1.8rem; font-weight: 700; color: #0d6efd; }
+  .card .label { font-size: .85rem; color: #6c757d; margin-top: .3rem; }
+  table { width: 100%%; border-collapse: collapse; background: #fff;
+          border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+  th, td { text-align: left; padding: .6rem .8rem; border-bottom: 1px solid #dee2e6; }
+  th { background: #e9ecef; font-size: .85rem; text-transform: uppercase; }
+  td { font-size: .9rem; }
+  .section { margin: 2rem 0; }
+  .bar { background: #0d6efd; height: 20px; border-radius: 3px; min-width: 2px; }
+  .bar-row { display: flex; align-items: center; gap: .5rem; margin: .3rem 0; }
+  .bar-label { font-size: .8rem; width: 80px; text-align: right; }
+  .bar-value { font-size: .8rem; color: #6c757d; }
+</style>
+</head><body>
+<h1>Spending Bot Dashboard</h1>
+
+<div class="cards">
+  <div class="card"><div class="value">%(today)s</div>
+    <div class="label">Messages today</div></div>
+  <div class="card"><div class="value">%(week)s</div>
+    <div class="label">Messages this week</div></div>
+  <div class="card"><div class="value">%(total)s</div>
+    <div class="label">Total messages</div></div>
+  <div class="card"><div class="value">%(avg_llm)s</div>
+    <div class="label">Avg LLM response (s)</div></div>
+  <div class="card"><div class="value">%(avg_total)s</div>
+    <div class="label">Avg total response (s)</div></div>
+  <div class="card"><div class="value">%(error_rate)s</div>
+    <div class="label">Error rate</div></div>
+</div>
+
+<div class="section">
+<h2>Messages per user</h2>
+<table><tr><th>User (hashed)</th><th>Messages</th><th>LLM queries</th></tr>
+%(user_rows)s
+</table></div>
+
+<div class="section">
+<h2>Common question patterns</h2>
+<table><tr><th>Message</th><th>Count</th></tr>
+%(pattern_rows)s
+</table></div>
+
+<div class="section">
+<h2>Messages over time (last 7 days)</h2>
+%(timeseries)s
+</div>
+
+</body></html>"""
+
+
+@app.route("/dashboard")
+def dashboard():
+    now = datetime.now(timezone.utc)
+    today_str = now.strftime("%Y-%m-%d")
+    week_ago = (now - timedelta(days=7)).isoformat()
+
+    try:
+        # Counts - today's messages
+        today_response = (
+            supabase.table("metrics")
+            .select("*", count="exact")
+            .gte("timestamp", today_str)
+            .execute()
+        )
+        today = today_response.count
+
+        # Count - this week
+        week_response = (
+            supabase.table("metrics")
+            .select("*", count="exact")
+            .gte("timestamp", week_ago)
+            .execute()
+        )
+        week = week_response.count
+
+        # Count - total
+        total_response = supabase.table("metrics").select("*", count="exact").execute()
+        total = total_response.count
+
+        # Averages - fetch all metrics with LLM for client-side aggregation
+        metrics_with_llm = (
+            supabase.table("metrics")
+            .select("llm_response_time")
+            .eq("used_llm", True)
+            .not_.is_("llm_response_time", "null")
+            .execute()
+        )
+
+        if metrics_with_llm.data:
+            llm_times = [m["llm_response_time"] for m in metrics_with_llm.data]
+            avg_llm_value = sum(llm_times) / len(llm_times)
+            avg_llm = f"{avg_llm_value:.2f}"
+        else:
+            avg_llm = "-"
+
+        # Average total response time
+        all_metrics = supabase.table("metrics").select("total_response_time").execute()
+
+        if all_metrics.data:
+            total_times = [m["total_response_time"] for m in all_metrics.data]
+            avg_total_value = sum(total_times) / len(total_times)
+            avg_total = f"{avg_total_value:.2f}"
+        else:
+            avg_total = "-"
+
+        # Error rate
+        errors_response = (
+            supabase.table("metrics").select("*", count="exact").eq("success", False).execute()
+        )
+        errors = errors_response.count
+        error_rate = f"{errors / total * 100:.1f}%" if total > 0 else "0%"
+
+        # Users - fetch all metrics and group client-side
+        all_metrics_for_users = supabase.table("metrics").select("user_id, used_llm").execute()
+
+        user_stats = defaultdict(lambda: {"cnt": 0, "llm_cnt": 0})
+        for m in all_metrics_for_users.data:
+            user_stats[m["user_id"]]["cnt"] += 1
+            user_stats[m["user_id"]]["llm_cnt"] += 1 if m["used_llm"] else 0
+
+        # Get user phone_hashes for top 20 users
+        sorted_users = sorted(
+            user_stats.keys(), key=lambda uid: user_stats[uid]["cnt"], reverse=True
+        )
+        top_user_ids = sorted_users[:20]
+
+        if top_user_ids:
+            users_data = (
+                supabase.table("users").select("id, phone_hash").in_("id", top_user_ids).execute()
+            )
+
+            # Create lookup dict
+            user_hash_map = {u["id"]: u["phone_hash"] for u in users_data.data}
+
+            # Format for template
+            users = [
+                {
+                    "user_hash": user_hash_map.get(uid, "unknown"),
+                    "cnt": user_stats[uid]["cnt"],
+                    "llm_cnt": user_stats[uid]["llm_cnt"],
+                }
+                for uid in top_user_ids
+            ]
+        else:
+            users = []
+
+        user_rows = "".join(
+            f"<tr><td><code>{escape(u['user_hash'])}</code></td>"
+            f"<td>{u['cnt']}</td><td>{u['llm_cnt']}</td></tr>"
+            for u in users
+        )
+
+        # Patterns - fetch all message texts and group client-side
+        all_messages = supabase.table("metrics").select("message_text").execute()
+
+        pattern_counter = defaultdict(int)
+        for m in all_messages.data:
+            pattern_counter[m["message_text"].lower()] += 1
+
+        patterns = sorted(pattern_counter.items(), key=lambda x: x[1], reverse=True)[:15]
+        pattern_rows = "".join(
+            f"<tr><td>{escape(msg)}</td><td>{cnt}</td></tr>" for msg, cnt in patterns
+        )
+
+        # Time series - fetch metrics from last 7 days and group by day
+        week_metrics = (
+            supabase.table("metrics").select("timestamp").gte("timestamp", week_ago).execute()
+        )
+
+        day_counter = defaultdict(int)
+        for m in week_metrics.data:
+            day = m["timestamp"][:10]  # Extract YYYY-MM-DD
+            day_counter[day] += 1
+
+        days = sorted(day_counter.items())
+        max_cnt = max((cnt for _, cnt in days), default=1)
+        timeseries = "".join(
+            f'<div class="bar-row">'
+            f'<span class="bar-label">{day[5:]}</span>'
+            f'<div class="bar" style="width:{cnt / max_cnt * 400}px"></div>'
+            f'<span class="bar-value">{cnt}</span></div>'
+            for day, cnt in days
+        )
+        if not timeseries:
+            timeseries = "<p>No data yet.</p>"
+
+    except Exception as e:
+        print(f"Error fetching dashboard data: {e}", file=sys.stderr)
+        return (
+            f"<html><body><h1>Error loading dashboard</h1><p>{escape(str(e))}</p></body></html>",
+            500,
+        )
+
+    html = DASHBOARD_HTML % {
+        "today": today,
+        "week": week,
+        "total": total,
+        "avg_llm": avg_llm,
+        "avg_total": avg_total,
+        "error_rate": error_rate,
+        "user_rows": user_rows or "<tr><td colspan=3>No data yet</td></tr>",
+        "pattern_rows": pattern_rows or "<tr><td colspan=2>No data yet</td></tr>",
+        "timeseries": timeseries,
+    }
+    return html
 
 
 if __name__ == "__main__":
