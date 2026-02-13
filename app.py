@@ -71,6 +71,13 @@ TRANSACTIONS: list[dict] = _load_user_transactions(DEFAULT_USER_ID)
 
 def build_spending_summary() -> str:
     """Pre-compute a text summary of all transactions for the LLM system prompt."""
+    # Handle empty transactions gracefully
+    if not TRANSACTIONS:
+        return (
+            "You are a helpful financial assistant for a South African FNB bank account.\n"
+            "No transaction data is currently loaded. Please try again later or contact support."
+        )
+
     total_debits = sum(t["amount"] for t in TRANSACTIONS if t["amount"] < 0)
     total_credits = sum(t["amount"] for t in TRANSACTIONS if t["amount"] > 0)
     debit_count = sum(1 for t in TRANSACTIONS if t["amount"] < 0)
