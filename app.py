@@ -466,7 +466,9 @@ def _keyword_result(content: str) -> dict:
 def handle_message(body: str) -> dict:
     """Route an incoming message to the appropriate handler. Returns a result dict."""
     text = body.strip().lower()
+    word_count = len(text.split())
 
+    # Exact keyword matches
     if text in ("help", "commands", "menu", "hi", "hello", "?"):
         return _keyword_result(cmd_help())
 
@@ -482,14 +484,24 @@ def handle_message(body: str) -> dict:
     if text in ("top merchants", "top spend", "top", "biggest", "top 10"):
         return _keyword_result(cmd_top_merchants())
 
+    # Month keywords (exact matches only)
     for keyword, month_num in MONTH_KEYWORDS.items():
-        if keyword in text:
+        if keyword == text or text == f"{keyword} spending":
             return _keyword_result(cmd_month_spending(month_num))
 
-    # Try merchant keyword search first
-    merchant_result = cmd_merchant_search(text)
-    if not merchant_result.startswith("No transactions found"):
-        return {"content": merchant_result, "used_llm": False}
+    # For natural language questions (more than 3 words or contains question words), use LLM
+    if word_count > 3 or "?" in text or any(
+        word in text for word in ["how", "what", "when", "where", "why", "much", "many", "did", "do", "can"]
+    ):
+        result = ask_llm(body.strip())
+        result["used_llm"] = True
+        return result
+
+    # Try merchant keyword search (only for short queries)
+    if word_count <= 3:
+        merchant_result = cmd_merchant_search(text)
+        if not merchant_result.startswith("No transactions found"):
+            return {"content": merchant_result, "used_llm": False}
 
     # Fallback: ask the LLM
     result = ask_llm(body.strip())
