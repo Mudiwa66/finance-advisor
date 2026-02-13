@@ -18,8 +18,8 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 load_dotenv()
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "llama3.2"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 
 # ---------------------------------------------------------------------------
 # Supabase configuration
@@ -27,6 +27,15 @@ OLLAMA_MODEL = "llama3.2"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# Debug logging for Railway deployment
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("ERROR: Missing Supabase environment variables!", file=sys.stderr)
+    print(f"SUPABASE_URL: {'SET' if SUPABASE_URL else 'NOT SET'}", file=sys.stderr)
+    print(f"SUPABASE_KEY: {'SET' if SUPABASE_KEY else 'NOT SET'}", file=sys.stderr)
+    print("Available env vars:", list(os.environ.keys()), file=sys.stderr)
+    sys.exit(1)
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ---------------------------------------------------------------------------
@@ -795,4 +804,6 @@ def dashboard():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5001)
+    port = int(os.getenv("PORT", 5001))
+    debug = os.getenv("FLASK_DEBUG", "False").lower() == "true"
+    app.run(debug=debug, host="0.0.0.0", port=port)
