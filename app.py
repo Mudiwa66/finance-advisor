@@ -18,10 +18,11 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 load_dotenv()
 
-# LLM Configuration - Use Hugging Face Inference API (works on Railway!)
+# LLM Configuration - Use Hugging Face Serverless Inference API
 HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
 HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")
-HUGGINGFACE_API_URL = f"https://api-inference.huggingface.co/models/{HUGGINGFACE_MODEL}"
+# Use v1 endpoint (new HF Serverless Inference API)
+HUGGINGFACE_API_URL = f"https://api-inference.huggingface.co/models/{HUGGINGFACE_MODEL}/v1/chat/completions"
 
 # ---------------------------------------------------------------------------
 # Supabase configuration
@@ -151,22 +152,22 @@ def ask_llm(question: str) -> dict:
         }
 
     try:
-        # Format prompt for Mistral Instruct model
-        prompt = f"<s>[INST] {SPENDING_SUMMARY}\n\n{question} [/INST]"
-
+        # Use OpenAI-compatible chat completions format (v1 API)
         headers = {
             "Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}",
             "Content-Type": "application/json",
         }
 
         payload = {
-            "inputs": prompt,
-            "parameters": {
-                "max_new_tokens": 500,
-                "temperature": 0.7,
-                "top_p": 0.95,
-                "return_full_text": False,
-            },
+            "model": HUGGINGFACE_MODEL,
+            "messages": [
+                {"role": "system", "content": SPENDING_SUMMARY},
+                {"role": "user", "content": question},
+            ],
+            "max_tokens": 500,
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "stream": False,
         }
 
         resp = http_requests.post(
@@ -179,16 +180,13 @@ def ask_llm(question: str) -> dict:
         data = resp.json()
         elapsed = time.monotonic() - start
 
-        # Handle different response formats
-        if isinstance(data, list) and len(data) > 0:
-            content = data[0].get("generated_text", "")
-        elif isinstance(data, dict):
-            content = data.get("generated_text", data.get("error", "No response"))
+        # Parse OpenAI-compatible response format
+        if "choices" in data and len(data["choices"]) > 0:
+            content = data["choices"][0]["message"]["content"]
+            tokens = data.get("usage", {}).get("total_tokens", len(content) // 4)
         else:
-            content = str(data)
-
-        # Estimate tokens (rough approximation: ~4 chars per token)
-        tokens = len(prompt + content) // 4
+            content = data.get("error", "No response from model")
+            tokens = 0
 
         return {
             "content": content.strip(),
