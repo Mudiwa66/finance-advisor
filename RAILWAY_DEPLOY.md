@@ -10,11 +10,23 @@
    - Choose this repository
 
 3. **Set Environment Variables** in Railway dashboard:
+
+   **CRITICAL**: Environment variables MUST be set in Railway's dashboard, NOT in GitHub secrets or .env files!
+
+   Steps to set environment variables in Railway:
+   1. Go to your Railway project dashboard
+   2. Click on your service/deployment
+   3. Go to the "Variables" tab
+   4. Click "+ New Variable" for each of the following:
+
    ```
-   SUPABASE_URL=your_supabase_project_url
-   SUPABASE_KEY=your_supabase_service_role_key
-   DEFAULT_USER_ID=your_default_user_uuid
+   SUPABASE_URL=https://oanalylscevtqbriwnva.supabase.co
+   SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9hbmFseWxzY2V2dHFicml3bnZhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDcyNjMzNiwiZXhwIjoyMDg2MzAyMzM2fQ.7KhqD8shX1MouEV2JWZSsS7_K3psK8JFx23NaB6si48
+   DEFAULT_USER_ID=c14571e0-874b-4d22-929e-f4e4fc73706b
    ```
+
+   5. After adding all variables, Railway will automatically redeploy
+   6. If it doesn't redeploy, click "Deploy" → "Redeploy"
 
 4. **Optional Environment Variables**:
    ```
