@@ -18,8 +18,10 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 load_dotenv()
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+# LLM Configuration - Use Hugging Face Inference API (works on Railway!)
+HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
+HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")
+HUGGINGFACE_API_URL = f"https://api-inference.huggingface.co/models/{HUGGINGFACE_MODEL}"
 
 # ---------------------------------------------------------------------------
 # Supabase configuration
@@ -131,34 +133,88 @@ def build_spending_summary() -> str:
     )
 
 
-def ask_ollama(question: str) -> dict:
-    """Send a question to llama3.2 via Ollama. Returns dict with content, timing, tokens."""
+def ask_llm(question: str) -> dict:
+    """Send a question to Mistral via Hugging Face Inference API. Returns dict with content, timing, tokens."""
     start = time.monotonic()
+
+    if not HUGGINGFACE_API_TOKEN:
+        # Fallback if no API token
+        elapsed = time.monotonic() - start
+        return {
+            "content": (
+                "LLM is not configured. "
+                "Try a keyword like *total*, *uber*, *march*, or type *help*."
+            ),
+            "llm_time": round(elapsed, 3),
+            "tokens": 0,
+            "error": True,
+        }
+
     try:
-        resp = http_requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": [
-                    {"role": "system", "content": SPENDING_SUMMARY},
-                    {"role": "user", "content": question},
-                ],
-                "stream": False,
+        # Format prompt for Mistral Instruct model
+        prompt = f"<s>[INST] {SPENDING_SUMMARY}\n\n{question} [/INST]"
+
+        headers = {
+            "Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": 500,
+                "temperature": 0.7,
+                "top_p": 0.95,
+                "return_full_text": False,
             },
+        }
+
+        resp = http_requests.post(
+            HUGGINGFACE_API_URL,
+            headers=headers,
+            json=payload,
             timeout=30,
         )
         resp.raise_for_status()
         data = resp.json()
         elapsed = time.monotonic() - start
-        tokens = data.get("eval_count", 0) + data.get("prompt_eval_count", 0)
+
+        # Handle different response formats
+        if isinstance(data, list) and len(data) > 0:
+            content = data[0].get("generated_text", "")
+        elif isinstance(data, dict):
+            content = data.get("generated_text", data.get("error", "No response"))
+        else:
+            content = str(data)
+
+        # Estimate tokens (rough approximation: ~4 chars per token)
+        tokens = len(prompt + content) // 4
+
         return {
-            "content": data["message"]["content"],
+            "content": content.strip(),
             "llm_time": round(elapsed, 3),
             "tokens": tokens,
             "error": False,
         }
-    except Exception:
+    except http_requests.exceptions.HTTPError as e:
         elapsed = time.monotonic() - start
+        # Handle rate limiting
+        if e.response.status_code == 429:
+            error_msg = "Rate limit exceeded. Please try again in a moment."
+        elif e.response.status_code == 503:
+            error_msg = "Model is loading. Please wait ~20 seconds and try again."
+        else:
+            error_msg = f"API error ({e.response.status_code}). Try keywords instead."
+
+        return {
+            "content": f"{error_msg} Try *total*, *uber*, *march*, or *help*.",
+            "llm_time": round(elapsed, 3),
+            "tokens": 0,
+            "error": True,
+        }
+    except Exception as e:
+        elapsed = time.monotonic() - start
+        print(f"LLM error: {e}", file=sys.stderr)
         return {
             "content": (
                 "Sorry, I couldn't process that right now. "
@@ -436,7 +492,7 @@ def handle_message(body: str) -> dict:
         return {"content": merchant_result, "used_llm": False}
 
     # Fallback: ask the LLM
-    result = ask_ollama(body.strip())
+    result = ask_llm(body.strip())
     result["used_llm"] = True
     return result
 
