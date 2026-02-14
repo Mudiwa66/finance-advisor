@@ -596,26 +596,41 @@ def _log_metric(
 def webhook():
     """Receive incoming WhatsApp messages from Twilio and respond."""
     start = time.monotonic()
-    incoming_msg = request.form.get("Body", "").strip()
-    user_phone = request.form.get("From", "anonymous")
-    user_hash = _hash_user(user_phone)
 
-    result = handle_message(incoming_msg)
-    total_time = time.monotonic() - start
+    try:
+        incoming_msg = request.form.get("Body", "").strip()
+        user_phone = request.form.get("From", "anonymous")
+        user_hash = _hash_user(user_phone)
 
-    _log_metric(
-        user_hash=user_hash,
-        message_text=incoming_msg,
-        used_llm=result.get("used_llm", False),
-        llm_time=result.get("llm_time"),
-        total_time=total_time,
-        success=not result.get("error", False),
-        tokens=result.get("tokens", 0),
-    )
+        print(f"[WEBHOOK] Received message from {user_hash[:8]}: '{incoming_msg[:50]}'", file=sys.stderr)
 
-    resp = MessagingResponse()
-    resp.message(result["content"])
-    return str(resp), 200, {"Content-Type": "application/xml"}
+        result = handle_message(incoming_msg)
+        total_time = time.monotonic() - start
+
+        _log_metric(
+            user_hash=user_hash,
+            message_text=incoming_msg,
+            used_llm=result.get("used_llm", False),
+            llm_time=result.get("llm_time"),
+            total_time=total_time,
+            success=not result.get("error", False),
+            tokens=result.get("tokens", 0),
+        )
+
+        resp = MessagingResponse()
+        resp.message(result["content"])
+        print(f"[WEBHOOK] Sending response: '{result['content'][:50]}'", file=sys.stderr)
+        return str(resp), 200, {"Content-Type": "application/xml"}
+
+    except Exception as e:
+        print(f"[WEBHOOK ERROR] {type(e).__name__}: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+
+        # Return error message to user
+        resp = MessagingResponse()
+        resp.message("Sorry, an error occurred. Please try again or type *help*.")
+        return str(resp), 200, {"Content-Type": "application/xml"}
 
 
 # ---------------------------------------------------------------------------
