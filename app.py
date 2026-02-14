@@ -539,6 +539,29 @@ def handle_message(body: str) -> dict:
 
 app = Flask(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Health Check Routes
+# ---------------------------------------------------------------------------
+
+
+@app.route("/", methods=["GET"])
+def health_check():
+    """Health check endpoint for Railway."""
+    return {
+        "status": "ok",
+        "service": "whatsapp-financial-advisor",
+        "transactions_loaded": len(TRANSACTIONS),
+        "llm_configured": model is not None,
+    }
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Alternative health check endpoint."""
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
 # ---------------------------------------------------------------------------
 # Metrics database (now using Supabase)
 # ---------------------------------------------------------------------------
@@ -915,6 +938,20 @@ def dashboard():
         "timeseries": timeseries,
     }
     return html
+
+
+# ---------------------------------------------------------------------------
+# Startup Logging
+# ---------------------------------------------------------------------------
+
+# Log all registered routes for debugging
+print("\n" + "=" * 60, file=sys.stderr)
+print("[STARTUP] Flask app initialized successfully!", file=sys.stderr)
+print("[STARTUP] Registered routes:", file=sys.stderr)
+for rule in app.url_map.iter_rules():
+    methods = ",".join(sorted(rule.methods - {"HEAD", "OPTIONS"}))
+    print(f"  {rule.rule:30s} {methods}", file=sys.stderr)
+print("=" * 60 + "\n", file=sys.stderr)
 
 
 if __name__ == "__main__":
