@@ -24,6 +24,11 @@ HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "mistralai/Mistral-7B-Instruc
 # Use v1 endpoint (new HF Serverless Inference API)
 HUGGINGFACE_API_URL = f"https://api-inference.huggingface.co/models/{HUGGINGFACE_MODEL}/v1/chat/completions"
 
+# Debug logging for LLM configuration
+print(f"[LLM CONFIG] HF Token: {'SET' if HUGGINGFACE_API_TOKEN else 'NOT SET'}", file=sys.stderr)
+print(f"[LLM CONFIG] HF Model: {HUGGINGFACE_MODEL}", file=sys.stderr)
+print(f"[LLM CONFIG] HF URL: {HUGGINGFACE_API_URL}", file=sys.stderr)
+
 # ---------------------------------------------------------------------------
 # Supabase configuration
 # ---------------------------------------------------------------------------
@@ -138,8 +143,11 @@ def ask_llm(question: str) -> dict:
     """Send a question to Mistral via Hugging Face Inference API. Returns dict with content, timing, tokens."""
     start = time.monotonic()
 
+    print(f"[LLM] Called with question: '{question[:50]}...'", file=sys.stderr)
+
     if not HUGGINGFACE_API_TOKEN:
         # Fallback if no API token
+        print(f"[LLM ERROR] HUGGINGFACE_API_TOKEN not set!", file=sys.stderr)
         elapsed = time.monotonic() - start
         return {
             "content": (
@@ -176,6 +184,8 @@ def ask_llm(question: str) -> dict:
             json=payload,
             timeout=30,
         )
+
+        print(f"[LLM] API Response status: {resp.status_code}", file=sys.stderr)
         resp.raise_for_status()
         data = resp.json()
         elapsed = time.monotonic() - start
@@ -184,9 +194,11 @@ def ask_llm(question: str) -> dict:
         if "choices" in data and len(data["choices"]) > 0:
             content = data["choices"][0]["message"]["content"]
             tokens = data.get("usage", {}).get("total_tokens", len(content) // 4)
+            print(f"[LLM] Success! Response length: {len(content)} chars", file=sys.stderr)
         else:
             content = data.get("error", "No response from model")
             tokens = 0
+            print(f"[LLM] No choices in response. Data: {data}", file=sys.stderr)
 
         return {
             "content": content.strip(),
@@ -196,6 +208,7 @@ def ask_llm(question: str) -> dict:
         }
     except http_requests.exceptions.HTTPError as e:
         elapsed = time.monotonic() - start
+        print(f"[LLM ERROR] HTTP {e.response.status_code}: {e.response.text}", file=sys.stderr)
         # Handle rate limiting
         if e.response.status_code == 429:
             error_msg = "Rate limit exceeded. Please try again in a moment."
@@ -212,7 +225,7 @@ def ask_llm(question: str) -> dict:
         }
     except Exception as e:
         elapsed = time.monotonic() - start
-        print(f"LLM error: {e}", file=sys.stderr)
+        print(f"[LLM ERROR] Exception: {type(e).__name__}: {e}", file=sys.stderr)
         return {
             "content": (
                 "Sorry, I couldn't process that right now. "
@@ -466,8 +479,11 @@ def handle_message(body: str) -> dict:
     text = body.strip().lower()
     word_count = len(text.split())
 
+    print(f"[ROUTING] Message: '{text}' | Words: {word_count}", file=sys.stderr)
+
     # Exact keyword matches
     if text in ("help", "commands", "menu", "hi", "hello", "?"):
+        print(f"[ROUTING] Using keyword: help", file=sys.stderr)
         return _keyword_result(cmd_help())
 
     if text in ("total spending", "total spend", "total debits", "total"):
@@ -491,6 +507,7 @@ def handle_message(body: str) -> dict:
     if word_count > 3 or "?" in text or any(
         word in text for word in ["how", "what", "when", "where", "why", "much", "many", "did", "do", "can"]
     ):
+        print(f"[ROUTING] Using LLM (natural language detected)", file=sys.stderr)
         result = ask_llm(body.strip())
         result["used_llm"] = True
         return result
@@ -499,9 +516,11 @@ def handle_message(body: str) -> dict:
     if word_count <= 3:
         merchant_result = cmd_merchant_search(text)
         if not merchant_result.startswith("No transactions found"):
+            print(f"[ROUTING] Using keyword: merchant search", file=sys.stderr)
             return {"content": merchant_result, "used_llm": False}
 
     # Fallback: ask the LLM
+    print(f"[ROUTING] Using LLM (fallback)", file=sys.stderr)
     result = ask_llm(body.strip())
     result["used_llm"] = True
     return result
