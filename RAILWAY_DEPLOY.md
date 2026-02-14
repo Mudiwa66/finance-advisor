@@ -21,8 +21,9 @@
 
    ```
    SUPABASE_URL=https://oanalylscevtqbriwnva.supabase.co
-   SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9hbmFseWxzY2V2dHFicml3bnZhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDcyNjMzNiwiZXhwIjoyMDg2MzAyMzM2fQ.7KhqD8shX1MouEV2JWZSsS7_K3psK8JFx23NaB6si48
+   SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9hbmFseWxzY2V2dHFpcml3bnZhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDcyNjMzNiwiZXhwIjoyMDg2MzAyMzM2fQ.7KhqD8shX1MouEV2JWZSsS7_K3psK8JFx23NaB6si48
    DEFAULT_USER_ID=c14571e0-874b-4d22-929e-f4e4fc73706b
+   GEMINI_API_KEY=your_gemini_api_key_here
    ```
 
    5. After adding all variables, Railway will automatically redeploy
@@ -30,8 +31,7 @@
 
 4. **Optional Environment Variables**:
    ```
-   OLLAMA_URL=http://your-ollama-instance/api/chat
-   OLLAMA_MODEL=llama3.2
+   GEMINI_MODEL=gemini-1.5-flash
    FLASK_DEBUG=False
    ```
 
@@ -39,7 +39,8 @@
 
 - Railway automatically sets the `PORT` environment variable
 - The app is configured to use `gunicorn` for production
-- Ollama must be deployed separately (or use a hosted instance)
+- LLM uses Google Gemini API (gemini-1.5-flash) - free and fast!
+- Natural language queries are supported with the Gemini API key
 - For Twilio webhook, use the Railway-provided URL: `https://your-app.railway.app/webhook`
 
 ## Post-Deployment

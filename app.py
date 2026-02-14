@@ -9,7 +9,6 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
-import requests as http_requests
 from dotenv import load_dotenv
 from flask import Flask, request
 from markupsafe import escape
@@ -18,8 +17,31 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 load_dotenv()
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+# LLM Configuration - Use Google Gemini API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+
+# Try to import and configure Gemini
+model = None
+try:
+    import google.generativeai as genai
+    if GEMINI_API_KEY:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        print("[LLM CONFIG] Gemini configured successfully", file=sys.stderr)
+    else:
+        print("[LLM CONFIG] Gemini API Key: NOT SET", file=sys.stderr)
+except ImportError as e:
+    print(f"[LLM CONFIG] Failed to import google.generativeai: {e}", file=sys.stderr)
+    print("[LLM CONFIG] LLM features will be disabled", file=sys.stderr)
+except Exception as e:
+    print(f"[LLM CONFIG] Error configuring Gemini: {e}", file=sys.stderr)
+    model = None
+
+# Debug logging for LLM configuration
+print(f"[LLM CONFIG] Gemini API Key: {'SET' if GEMINI_API_KEY else 'NOT SET'}", file=sys.stderr)
+print(f"[LLM CONFIG] Gemini Model: {GEMINI_MODEL}", file=sys.stderr)
+print(f"[LLM CONFIG] Model object: {'READY' if model else 'NOT READY'}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Supabase configuration
@@ -46,6 +68,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 def _load_user_transactions(user_id: str) -> list[dict]:
     """Load all transactions for a user from Supabase."""
     try:
+        print(f"[STARTUP] Loading transactions for user_id: {user_id}...", file=sys.stderr)
         response = (
             supabase.table("transactions")
             .select("date, description, amount, balance, merchant")
@@ -53,16 +76,24 @@ def _load_user_transactions(user_id: str) -> list[dict]:
             .order("date")
             .execute()
         )
-        return response.data
+        transaction_count = len(response.data) if response.data else 0
+        print(f"[STARTUP] Loaded {transaction_count} transactions", file=sys.stderr)
+        return response.data if response.data else []
     except Exception as e:
-        print(f"Error loading transactions: {e}")
+        print(f"[STARTUP ERROR] Failed to load transactions: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
         return []
 
 
 # For backward compatibility, load default user's transactions at startup
 # TODO: Replace with actual user_id from migration script output
 DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "REPLACE_WITH_USER_ID_FROM_MIGRATION")
+print(f"[STARTUP] DEFAULT_USER_ID: {DEFAULT_USER_ID}", file=sys.stderr)
 TRANSACTIONS: list[dict] = _load_user_transactions(DEFAULT_USER_ID)
+
+if not TRANSACTIONS:
+    print("[STARTUP WARNING] No transactions loaded! LLM will have no spending data.", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Ollama LLM integration
@@ -71,6 +102,13 @@ TRANSACTIONS: list[dict] = _load_user_transactions(DEFAULT_USER_ID)
 
 def build_spending_summary() -> str:
     """Pre-compute a text summary of all transactions for the LLM system prompt."""
+    # Handle empty transactions gracefully
+    if not TRANSACTIONS:
+        return (
+            "You are a helpful financial assistant for a South African FNB bank account.\n"
+            "No transaction data is currently loaded. Please try again later or contact support."
+        )
+
     total_debits = sum(t["amount"] for t in TRANSACTIONS if t["amount"] < 0)
     total_credits = sum(t["amount"] for t in TRANSACTIONS if t["amount"] > 0)
     debit_count = sum(1 for t in TRANSACTIONS if t["amount"] < 0)
@@ -124,39 +162,82 @@ def build_spending_summary() -> str:
     )
 
 
-def ask_ollama(question: str) -> dict:
-    """Send a question to llama3.2 via Ollama. Returns dict with content, timing, tokens."""
+def ask_llm(question: str) -> dict:
+    """Send a question to Gemini. Returns dict with content, timing, tokens."""
     start = time.monotonic()
-    try:
-        resp = http_requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": [
-                    {"role": "system", "content": SPENDING_SUMMARY},
-                    {"role": "user", "content": question},
-                ],
-                "stream": False,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+
+    print(f"[LLM] Called with question: '{question[:50]}...'", file=sys.stderr)
+
+    if not model or not GEMINI_API_KEY:
+        # Fallback if no API token
+        print("[LLM ERROR] GEMINI_API_KEY not set!", file=sys.stderr)
         elapsed = time.monotonic() - start
-        tokens = data.get("eval_count", 0) + data.get("prompt_eval_count", 0)
         return {
-            "content": data["message"]["content"],
+            "content": (
+                "LLM is not configured. "
+                "Try a keyword like *total*, *uber*, *march*, or type *help*."
+            ),
+            "llm_time": round(elapsed, 3),
+            "tokens": 0,
+            "error": True,
+        }
+
+    try:
+        # Build prompt with context
+        prompt = f"{SPENDING_SUMMARY}\n\nUser question: {question}"
+
+        # Call Gemini API
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=500,
+                temperature=0.7,
+                top_p=0.95,
+            ),
+        )
+
+        elapsed = time.monotonic() - start
+
+        # Extract response text (safely handle blocked/filtered responses)
+        try:
+            text_content = response.text
+            if text_content:
+                content = text_content.strip()
+                # Estimate tokens (Gemini uses different tokenization, rough estimate)
+                tokens = len(content) // 4
+                print(f"[LLM] Success! Response length: {len(content)} chars", file=sys.stderr)
+            else:
+                content = "No response from model"
+                tokens = 0
+                print("[LLM] No text in response", file=sys.stderr)
+        except Exception as text_error:
+            # Accessing response.text can fail if response is blocked by safety filters
+            print(f"[LLM ERROR] Failed to access response.text: {text_error}", file=sys.stderr)
+            print(f"[LLM ERROR] Response object: {response}", file=sys.stderr)
+            content = "Response blocked by content filters. Try rephrasing your question or use a keyword like *total*, *uber*, *march*."
+            tokens = 0
+
+        return {
+            "content": content,
             "llm_time": round(elapsed, 3),
             "tokens": tokens,
             "error": False,
         }
-    except Exception:
+    except Exception as e:
         elapsed = time.monotonic() - start
+        print(f"[LLM ERROR] Exception: {type(e).__name__}: {e}", file=sys.stderr)
+
+        # Handle specific errors
+        error_msg = str(e)
+        if "quota" in error_msg.lower() or "rate" in error_msg.lower():
+            user_msg = "Rate limit exceeded. Please try again in a moment."
+        elif "invalid" in error_msg.lower() and "key" in error_msg.lower():
+            user_msg = "API key is invalid. Please check your configuration."
+        else:
+            user_msg = "Sorry, I couldn't process that right now."
+
         return {
-            "content": (
-                "Sorry, I couldn't process that right now. "
-                "Try a keyword like *total*, *uber*, *march*, or type *help*."
-            ),
+            "content": f"{user_msg} Try a keyword like *total*, *uber*, *march*, or type *help*.",
             "llm_time": round(elapsed, 3),
             "tokens": 0,
             "error": True,
@@ -403,8 +484,13 @@ def _keyword_result(content: str) -> dict:
 def handle_message(body: str) -> dict:
     """Route an incoming message to the appropriate handler. Returns a result dict."""
     text = body.strip().lower()
+    word_count = len(text.split())
 
+    print(f"[ROUTING] Message: '{text}' | Words: {word_count}", file=sys.stderr)
+
+    # Exact keyword matches
     if text in ("help", "commands", "menu", "hi", "hello", "?"):
+        print("[ROUTING] Using keyword: help", file=sys.stderr)
         return _keyword_result(cmd_help())
 
     if text in ("total spending", "total spend", "total debits", "total"):
@@ -419,17 +505,30 @@ def handle_message(body: str) -> dict:
     if text in ("top merchants", "top spend", "top", "biggest", "top 10"):
         return _keyword_result(cmd_top_merchants())
 
+    # Month keywords (exact matches only)
     for keyword, month_num in MONTH_KEYWORDS.items():
-        if keyword in text:
+        if keyword == text or text == f"{keyword} spending":
             return _keyword_result(cmd_month_spending(month_num))
 
-    # Try merchant keyword search first
-    merchant_result = cmd_merchant_search(text)
-    if not merchant_result.startswith("No transactions found"):
-        return {"content": merchant_result, "used_llm": False}
+    # For natural language questions (more than 3 words or contains question words), use LLM
+    if word_count > 3 or "?" in text or any(
+        word in text for word in ["how", "what", "when", "where", "why", "much", "many", "did", "do", "can"]
+    ):
+        print("[ROUTING] Using LLM (natural language detected)", file=sys.stderr)
+        result = ask_llm(body.strip())
+        result["used_llm"] = True
+        return result
+
+    # Try merchant keyword search (only for short queries)
+    if word_count <= 3:
+        merchant_result = cmd_merchant_search(text)
+        if not merchant_result.startswith("No transactions found"):
+            print("[ROUTING] Using keyword: merchant search", file=sys.stderr)
+            return {"content": merchant_result, "used_llm": False}
 
     # Fallback: ask the LLM
-    result = ask_ollama(body.strip())
+    print("[ROUTING] Using LLM (fallback)", file=sys.stderr)
+    result = ask_llm(body.strip())
     result["used_llm"] = True
     return result
 
@@ -439,6 +538,29 @@ def handle_message(body: str) -> dict:
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Health Check Routes
+# ---------------------------------------------------------------------------
+
+
+@app.route("/", methods=["GET"])
+def health_check():
+    """Health check endpoint for Railway."""
+    return {
+        "status": "ok",
+        "service": "whatsapp-financial-advisor",
+        "transactions_loaded": len(TRANSACTIONS),
+        "llm_configured": model is not None,
+    }
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Alternative health check endpoint."""
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
 
 # ---------------------------------------------------------------------------
 # Metrics database (now using Supabase)
@@ -514,26 +636,41 @@ def _log_metric(
 def webhook():
     """Receive incoming WhatsApp messages from Twilio and respond."""
     start = time.monotonic()
-    incoming_msg = request.form.get("Body", "").strip()
-    user_phone = request.form.get("From", "anonymous")
-    user_hash = _hash_user(user_phone)
 
-    result = handle_message(incoming_msg)
-    total_time = time.monotonic() - start
+    try:
+        incoming_msg = request.form.get("Body", "").strip()
+        user_phone = request.form.get("From", "anonymous")
+        user_hash = _hash_user(user_phone)
 
-    _log_metric(
-        user_hash=user_hash,
-        message_text=incoming_msg,
-        used_llm=result.get("used_llm", False),
-        llm_time=result.get("llm_time"),
-        total_time=total_time,
-        success=not result.get("error", False),
-        tokens=result.get("tokens", 0),
-    )
+        print(f"[WEBHOOK] Received message from {user_hash[:8]}: '{incoming_msg[:50]}'", file=sys.stderr)
 
-    resp = MessagingResponse()
-    resp.message(result["content"])
-    return str(resp), 200, {"Content-Type": "application/xml"}
+        result = handle_message(incoming_msg)
+        total_time = time.monotonic() - start
+
+        _log_metric(
+            user_hash=user_hash,
+            message_text=incoming_msg,
+            used_llm=result.get("used_llm", False),
+            llm_time=result.get("llm_time"),
+            total_time=total_time,
+            success=not result.get("error", False),
+            tokens=result.get("tokens", 0),
+        )
+
+        resp = MessagingResponse()
+        resp.message(result["content"])
+        print(f"[WEBHOOK] Sending response: '{result['content'][:50]}'", file=sys.stderr)
+        return str(resp), 200, {"Content-Type": "application/xml"}
+
+    except Exception as e:
+        print(f"[WEBHOOK ERROR] {type(e).__name__}: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+
+        # Return error message to user
+        resp = MessagingResponse()
+        resp.message("Sorry, an error occurred. Please try again or type *help*.")
+        return str(resp), 200, {"Content-Type": "application/xml"}
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +938,20 @@ def dashboard():
         "timeseries": timeseries,
     }
     return html
+
+
+# ---------------------------------------------------------------------------
+# Startup Logging
+# ---------------------------------------------------------------------------
+
+# Log all registered routes for debugging
+print("\n" + "=" * 60, file=sys.stderr)
+print("[STARTUP] Flask app initialized successfully!", file=sys.stderr)
+print("[STARTUP] Registered routes:", file=sys.stderr)
+for rule in app.url_map.iter_rules():
+    methods = ",".join(sorted(rule.methods - {"HEAD", "OPTIONS"}))
+    print(f"  {rule.rule:30s} {methods}", file=sys.stderr)
+print("=" * 60 + "\n", file=sys.stderr)
 
 
 if __name__ == "__main__":
