@@ -21,27 +21,26 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-# Try to import and configure Gemini
-model = None
+# Try to import and configure Gemini (using new google-genai package)
+client = None
 try:
-    import google.generativeai as genai
+    from google import genai
     if GEMINI_API_KEY:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        print("[LLM CONFIG] Gemini configured successfully", file=sys.stderr)
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        print("[LLM CONFIG] Gemini client configured successfully", file=sys.stderr)
     else:
         print("[LLM CONFIG] Gemini API Key: NOT SET", file=sys.stderr)
 except ImportError as e:
-    print(f"[LLM CONFIG] Failed to import google.generativeai: {e}", file=sys.stderr)
+    print(f"[LLM CONFIG] Failed to import google.genai: {e}", file=sys.stderr)
     print("[LLM CONFIG] LLM features will be disabled", file=sys.stderr)
 except Exception as e:
     print(f"[LLM CONFIG] Error configuring Gemini: {e}", file=sys.stderr)
-    model = None
+    client = None
 
 # Debug logging for LLM configuration
 print(f"[LLM CONFIG] Gemini API Key: {'SET' if GEMINI_API_KEY else 'NOT SET'}", file=sys.stderr)
 print(f"[LLM CONFIG] Gemini Model: {GEMINI_MODEL}", file=sys.stderr)
-print(f"[LLM CONFIG] Model object: {'READY' if model else 'NOT READY'}", file=sys.stderr)
+print(f"[LLM CONFIG] Client object: {'READY' if client else 'NOT READY'}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Supabase configuration
@@ -168,7 +167,7 @@ def ask_llm(question: str) -> dict:
 
     print(f"[LLM] Called with question: '{question[:50]}...'", file=sys.stderr)
 
-    if not model or not GEMINI_API_KEY:
+    if not client or not GEMINI_API_KEY:
         # Fallback if no API token
         print("[LLM ERROR] GEMINI_API_KEY not set!", file=sys.stderr)
         elapsed = time.monotonic() - start
@@ -186,14 +185,11 @@ def ask_llm(question: str) -> dict:
         # Build prompt with context
         prompt = f"{SPENDING_SUMMARY}\n\nUser question: {question}"
 
-        # Call Gemini API
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=500,
-                temperature=0.7,
-                top_p=0.95,
-            ),
+        # Call Gemini API using new google-genai package
+        # Note: model name should be just the model ID, SDK handles the full path
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,  # e.g. "gemini-1.5-flash"
+            contents=prompt,
         )
 
         elapsed = time.monotonic() - start
@@ -552,7 +548,7 @@ def health_check():
         "status": "ok",
         "service": "whatsapp-financial-advisor",
         "transactions_loaded": len(TRANSACTIONS),
-        "llm_configured": model is not None,
+        "llm_configured": client is not None,
     }
 
 
