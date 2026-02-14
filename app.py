@@ -9,7 +9,6 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
-import google.generativeai as genai
 from dotenv import load_dotenv
 from flask import Flask, request
 from markupsafe import escape
@@ -22,16 +21,27 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-# Configure Gemini
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(GEMINI_MODEL)
-else:
+# Try to import and configure Gemini
+model = None
+try:
+    import google.generativeai as genai
+    if GEMINI_API_KEY:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        print(f"[LLM CONFIG] Gemini configured successfully", file=sys.stderr)
+    else:
+        print(f"[LLM CONFIG] Gemini API Key: NOT SET", file=sys.stderr)
+except ImportError as e:
+    print(f"[LLM CONFIG] Failed to import google.generativeai: {e}", file=sys.stderr)
+    print(f"[LLM CONFIG] LLM features will be disabled", file=sys.stderr)
+except Exception as e:
+    print(f"[LLM CONFIG] Error configuring Gemini: {e}", file=sys.stderr)
     model = None
 
 # Debug logging for LLM configuration
 print(f"[LLM CONFIG] Gemini API Key: {'SET' if GEMINI_API_KEY else 'NOT SET'}", file=sys.stderr)
 print(f"[LLM CONFIG] Gemini Model: {GEMINI_MODEL}", file=sys.stderr)
+print(f"[LLM CONFIG] Model object: {'READY' if model else 'NOT READY'}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Supabase configuration
