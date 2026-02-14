@@ -186,14 +186,10 @@ def ask_llm(question: str) -> dict:
         prompt = f"{SPENDING_SUMMARY}\n\nUser question: {question}"
 
         # Call Gemini API using new google-genai package
+        # Note: model name should be just the model ID, SDK handles the full path
         response = client.models.generate_content(
-            model=GEMINI_MODEL,
+            model=GEMINI_MODEL,  # e.g. "gemini-1.5-flash"
             contents=prompt,
-            config={
-                "max_output_tokens": 500,
-                "temperature": 0.7,
-                "top_p": 0.95,
-            },
         )
 
         elapsed = time.monotonic() - start
