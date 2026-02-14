@@ -28,12 +28,12 @@ try:
     if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel(GEMINI_MODEL)
-        print(f"[LLM CONFIG] Gemini configured successfully", file=sys.stderr)
+        print("[LLM CONFIG] Gemini configured successfully", file=sys.stderr)
     else:
-        print(f"[LLM CONFIG] Gemini API Key: NOT SET", file=sys.stderr)
+        print("[LLM CONFIG] Gemini API Key: NOT SET", file=sys.stderr)
 except ImportError as e:
     print(f"[LLM CONFIG] Failed to import google.generativeai: {e}", file=sys.stderr)
-    print(f"[LLM CONFIG] LLM features will be disabled", file=sys.stderr)
+    print("[LLM CONFIG] LLM features will be disabled", file=sys.stderr)
 except Exception as e:
     print(f"[LLM CONFIG] Error configuring Gemini: {e}", file=sys.stderr)
     model = None
@@ -170,7 +170,7 @@ def ask_llm(question: str) -> dict:
 
     if not model or not GEMINI_API_KEY:
         # Fallback if no API token
-        print(f"[LLM ERROR] GEMINI_API_KEY not set!", file=sys.stderr)
+        print("[LLM ERROR] GEMINI_API_KEY not set!", file=sys.stderr)
         elapsed = time.monotonic() - start
         return {
             "content": (
@@ -209,7 +209,7 @@ def ask_llm(question: str) -> dict:
             else:
                 content = "No response from model"
                 tokens = 0
-                print(f"[LLM] No text in response", file=sys.stderr)
+                print("[LLM] No text in response", file=sys.stderr)
         except Exception as text_error:
             # Accessing response.text can fail if response is blocked by safety filters
             print(f"[LLM ERROR] Failed to access response.text: {text_error}", file=sys.stderr)
@@ -490,7 +490,7 @@ def handle_message(body: str) -> dict:
 
     # Exact keyword matches
     if text in ("help", "commands", "menu", "hi", "hello", "?"):
-        print(f"[ROUTING] Using keyword: help", file=sys.stderr)
+        print("[ROUTING] Using keyword: help", file=sys.stderr)
         return _keyword_result(cmd_help())
 
     if text in ("total spending", "total spend", "total debits", "total"):
@@ -514,7 +514,7 @@ def handle_message(body: str) -> dict:
     if word_count > 3 or "?" in text or any(
         word in text for word in ["how", "what", "when", "where", "why", "much", "many", "did", "do", "can"]
     ):
-        print(f"[ROUTING] Using LLM (natural language detected)", file=sys.stderr)
+        print("[ROUTING] Using LLM (natural language detected)", file=sys.stderr)
         result = ask_llm(body.strip())
         result["used_llm"] = True
         return result
@@ -523,11 +523,11 @@ def handle_message(body: str) -> dict:
     if word_count <= 3:
         merchant_result = cmd_merchant_search(text)
         if not merchant_result.startswith("No transactions found"):
-            print(f"[ROUTING] Using keyword: merchant search", file=sys.stderr)
+            print("[ROUTING] Using keyword: merchant search", file=sys.stderr)
             return {"content": merchant_result, "used_llm": False}
 
     # Fallback: ask the LLM
-    print(f"[ROUTING] Using LLM (fallback)", file=sys.stderr)
+    print("[ROUTING] Using LLM (fallback)", file=sys.stderr)
     result = ask_llm(body.strip())
     result["used_llm"] = True
     return result
