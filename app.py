@@ -68,6 +68,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 def _load_user_transactions(user_id: str) -> list[dict]:
     """Load all transactions for a user from Supabase."""
     try:
+        print(f"[STARTUP] Loading transactions for user_id: {user_id}...", file=sys.stderr)
         response = (
             supabase.table("transactions")
             .select("date, description, amount, balance, merchant")
@@ -75,16 +76,24 @@ def _load_user_transactions(user_id: str) -> list[dict]:
             .order("date")
             .execute()
         )
-        return response.data
+        transaction_count = len(response.data) if response.data else 0
+        print(f"[STARTUP] Loaded {transaction_count} transactions", file=sys.stderr)
+        return response.data if response.data else []
     except Exception as e:
-        print(f"Error loading transactions: {e}")
+        print(f"[STARTUP ERROR] Failed to load transactions: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
         return []
 
 
 # For backward compatibility, load default user's transactions at startup
 # TODO: Replace with actual user_id from migration script output
 DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "REPLACE_WITH_USER_ID_FROM_MIGRATION")
+print(f"[STARTUP] DEFAULT_USER_ID: {DEFAULT_USER_ID}", file=sys.stderr)
 TRANSACTIONS: list[dict] = _load_user_transactions(DEFAULT_USER_ID)
+
+if not TRANSACTIONS:
+    print("[STARTUP WARNING] No transactions loaded! LLM will have no spending data.", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Ollama LLM integration
@@ -189,16 +198,24 @@ def ask_llm(question: str) -> dict:
 
         elapsed = time.monotonic() - start
 
-        # Extract response text
-        if response.text:
-            content = response.text.strip()
-            # Estimate tokens (Gemini uses different tokenization, rough estimate)
-            tokens = len(content) // 4
-            print(f"[LLM] Success! Response length: {len(content)} chars", file=sys.stderr)
-        else:
-            content = "No response from model"
+        # Extract response text (safely handle blocked/filtered responses)
+        try:
+            text_content = response.text
+            if text_content:
+                content = text_content.strip()
+                # Estimate tokens (Gemini uses different tokenization, rough estimate)
+                tokens = len(content) // 4
+                print(f"[LLM] Success! Response length: {len(content)} chars", file=sys.stderr)
+            else:
+                content = "No response from model"
+                tokens = 0
+                print(f"[LLM] No text in response", file=sys.stderr)
+        except Exception as text_error:
+            # Accessing response.text can fail if response is blocked by safety filters
+            print(f"[LLM ERROR] Failed to access response.text: {text_error}", file=sys.stderr)
+            print(f"[LLM ERROR] Response object: {response}", file=sys.stderr)
+            content = "Response blocked by content filters. Try rephrasing your question or use a keyword like *total*, *uber*, *march*."
             tokens = 0
-            print(f"[LLM] No text in response", file=sys.stderr)
 
         return {
             "content": content,
