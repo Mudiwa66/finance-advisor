@@ -9,7 +9,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
-import requests as http_requests
+import google.generativeai as genai
 from dotenv import load_dotenv
 from flask import Flask, request
 from markupsafe import escape
@@ -18,16 +18,20 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 load_dotenv()
 
-# LLM Configuration - Use Hugging Face Serverless Inference API
-HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
-HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")
-# Use v1 endpoint (new HF Serverless Inference API)
-HUGGINGFACE_API_URL = f"https://api-inference.huggingface.co/models/{HUGGINGFACE_MODEL}/v1/chat/completions"
+# LLM Configuration - Use Google Gemini API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+
+# Configure Gemini
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(GEMINI_MODEL)
+else:
+    model = None
 
 # Debug logging for LLM configuration
-print(f"[LLM CONFIG] HF Token: {'SET' if HUGGINGFACE_API_TOKEN else 'NOT SET'}", file=sys.stderr)
-print(f"[LLM CONFIG] HF Model: {HUGGINGFACE_MODEL}", file=sys.stderr)
-print(f"[LLM CONFIG] HF URL: {HUGGINGFACE_API_URL}", file=sys.stderr)
+print(f"[LLM CONFIG] Gemini API Key: {'SET' if GEMINI_API_KEY else 'NOT SET'}", file=sys.stderr)
+print(f"[LLM CONFIG] Gemini Model: {GEMINI_MODEL}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Supabase configuration
@@ -140,14 +144,14 @@ def build_spending_summary() -> str:
 
 
 def ask_llm(question: str) -> dict:
-    """Send a question to Mistral via Hugging Face Inference API. Returns dict with content, timing, tokens."""
+    """Send a question to Gemini. Returns dict with content, timing, tokens."""
     start = time.monotonic()
 
     print(f"[LLM] Called with question: '{question[:50]}...'", file=sys.stderr)
 
-    if not HUGGINGFACE_API_TOKEN:
+    if not model or not GEMINI_API_KEY:
         # Fallback if no API token
-        print(f"[LLM ERROR] HUGGINGFACE_API_TOKEN not set!", file=sys.stderr)
+        print(f"[LLM ERROR] GEMINI_API_KEY not set!", file=sys.stderr)
         elapsed = time.monotonic() - start
         return {
             "content": (
@@ -160,77 +164,53 @@ def ask_llm(question: str) -> dict:
         }
 
     try:
-        # Use OpenAI-compatible chat completions format (v1 API)
-        headers = {
-            "Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}",
-            "Content-Type": "application/json",
-        }
+        # Build prompt with context
+        prompt = f"{SPENDING_SUMMARY}\n\nUser question: {question}"
 
-        payload = {
-            "model": HUGGINGFACE_MODEL,
-            "messages": [
-                {"role": "system", "content": SPENDING_SUMMARY},
-                {"role": "user", "content": question},
-            ],
-            "max_tokens": 500,
-            "temperature": 0.7,
-            "top_p": 0.95,
-            "stream": False,
-        }
-
-        resp = http_requests.post(
-            HUGGINGFACE_API_URL,
-            headers=headers,
-            json=payload,
-            timeout=30,
+        # Call Gemini API
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=500,
+                temperature=0.7,
+                top_p=0.95,
+            ),
         )
 
-        print(f"[LLM] API Response status: {resp.status_code}", file=sys.stderr)
-        resp.raise_for_status()
-        data = resp.json()
         elapsed = time.monotonic() - start
 
-        # Parse OpenAI-compatible response format
-        if "choices" in data and len(data["choices"]) > 0:
-            content = data["choices"][0]["message"]["content"]
-            tokens = data.get("usage", {}).get("total_tokens", len(content) // 4)
+        # Extract response text
+        if response.text:
+            content = response.text.strip()
+            # Estimate tokens (Gemini uses different tokenization, rough estimate)
+            tokens = len(content) // 4
             print(f"[LLM] Success! Response length: {len(content)} chars", file=sys.stderr)
         else:
-            content = data.get("error", "No response from model")
+            content = "No response from model"
             tokens = 0
-            print(f"[LLM] No choices in response. Data: {data}", file=sys.stderr)
+            print(f"[LLM] No text in response", file=sys.stderr)
 
         return {
-            "content": content.strip(),
+            "content": content,
             "llm_time": round(elapsed, 3),
             "tokens": tokens,
             "error": False,
         }
-    except http_requests.exceptions.HTTPError as e:
-        elapsed = time.monotonic() - start
-        print(f"[LLM ERROR] HTTP {e.response.status_code}: {e.response.text}", file=sys.stderr)
-        # Handle rate limiting
-        if e.response.status_code == 429:
-            error_msg = "Rate limit exceeded. Please try again in a moment."
-        elif e.response.status_code == 503:
-            error_msg = "Model is loading. Please wait ~20 seconds and try again."
-        else:
-            error_msg = f"API error ({e.response.status_code}). Try keywords instead."
-
-        return {
-            "content": f"{error_msg} Try *total*, *uber*, *march*, or *help*.",
-            "llm_time": round(elapsed, 3),
-            "tokens": 0,
-            "error": True,
-        }
     except Exception as e:
         elapsed = time.monotonic() - start
         print(f"[LLM ERROR] Exception: {type(e).__name__}: {e}", file=sys.stderr)
+
+        # Handle specific errors
+        error_msg = str(e)
+        if "quota" in error_msg.lower() or "rate" in error_msg.lower():
+            user_msg = "Rate limit exceeded. Please try again in a moment."
+        elif "invalid" in error_msg.lower() and "key" in error_msg.lower():
+            user_msg = "API key is invalid. Please check your configuration."
+        else:
+            user_msg = "Sorry, I couldn't process that right now."
+
         return {
-            "content": (
-                "Sorry, I couldn't process that right now. "
-                "Try a keyword like *total*, *uber*, *march*, or type *help*."
-            ),
+            "content": f"{user_msg} Try a keyword like *total*, *uber*, *march*, or type *help*.",
             "llm_time": round(elapsed, 3),
             "tokens": 0,
             "error": True,

@@ -23,7 +23,7 @@
    SUPABASE_URL=https://oanalylscevtqbriwnva.supabase.co
    SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9hbmFseWxzY2V2dHFpcml3bnZhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MDcyNjMzNiwiZXhwIjoyMDg2MzAyMzM2fQ.7KhqD8shX1MouEV2JWZSsS7_K3psK8JFx23NaB6si48
    DEFAULT_USER_ID=c14571e0-874b-4d22-929e-f4e4fc73706b
-   HUGGINGFACE_API_TOKEN=your_huggingface_api_token_here
+   GEMINI_API_KEY=your_gemini_api_key_here
    ```
 
    5. After adding all variables, Railway will automatically redeploy
@@ -31,7 +31,7 @@
 
 4. **Optional Environment Variables**:
    ```
-   HUGGINGFACE_MODEL=mistralai/Mistral-7B-Instruct-v0.2
+   GEMINI_MODEL=gemini-1.5-flash
    FLASK_DEBUG=False
    ```
 
@@ -39,8 +39,8 @@
 
 - Railway automatically sets the `PORT` environment variable
 - The app is configured to use `gunicorn` for production
-- LLM uses Hugging Face Inference API (Mistral-7B) - works great on Railway!
-- Natural language queries are supported with the Hugging Face API token
+- LLM uses Google Gemini API (gemini-1.5-flash) - free and fast!
+- Natural language queries are supported with the Gemini API key
 - For Twilio webhook, use the Railway-provided URL: `https://your-app.railway.app/webhook`
 
 ## Post-Deployment
