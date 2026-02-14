@@ -31,7 +31,7 @@
 
 4. **Optional Environment Variables**:
    ```
-   GEMINI_MODEL=gemini-1.5-flash
+   GEMINI_MODEL=gemini-2.0-flash-preview
    FLASK_DEBUG=False
    ```
 
@@ -39,7 +39,7 @@
 
 - Railway automatically sets the `PORT` environment variable
 - The app is configured to use `gunicorn` for production
-- LLM uses Google Gemini API (gemini-1.5-flash) - free and fast!
+- LLM uses Google Gemini API (gemini-2.0-flash-preview by default)
 - Natural language queries are supported with the Gemini API key
 - For Twilio webhook, use the Railway-provided URL: `https://your-app.railway.app/webhook`
 
