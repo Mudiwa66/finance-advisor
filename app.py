@@ -362,15 +362,8 @@ MONTH_NAMES = {
 
 def cmd_help() -> str:
     return (
-        "Welcome! Here are the commands I understand:\n\n"
-        "- *total* - Total spending (all debits)\n"
-        "- *income* - Total income (all credits)\n"
-        "- *balance* - Closing account balance\n"
-        "- *top* - Top 10 merchants by spend\n"
-        "- *february* / *march* / *april* / *may* - Monthly spending\n"
-        "- *uber* / *bolt* / any merchant - Spending at that merchant\n"
-        "- Or just ask a question naturally!\n"
-        "- *help* - Show this message"
+        "👋 Hi! I'm your FNB spending assistant.\n\n"
+        "Ask me naturally, or try: *total*, *balance*, *top*, *march*, *uber*"
     )
 
 
