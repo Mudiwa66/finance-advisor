@@ -469,63 +469,174 @@ def cmd_merchant_search(query: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Intent Classification System
+# ---------------------------------------------------------------------------
+
+from intent_classifier import Intent, IntentClassifier
+
+
+# ---------------------------------------------------------------------------
 # Message router
 # ---------------------------------------------------------------------------
 
 
 def _keyword_result(content: str) -> dict:
-    return {"content": content, "used_llm": False}
+    return {"content": content, "used_llm": False, "intent": None, "confidence": 1.0}
 
 
-def handle_message(body: str) -> dict:
-    """Route an incoming message to the appropriate handler. Returns a result dict."""
-    text = body.strip().lower()
-    word_count = len(text.split())
+# Intent-specific handler functions
+def handle_greeting(message: str, confidence: float) -> dict:
+    """Handle greeting intents."""
+    return _keyword_result(cmd_help())
 
-    print(f"[ROUTING] Message: '{text}' | Words: {word_count}", file=sys.stderr)
 
-    # Exact keyword matches
-    if text in ("help", "commands", "menu", "hi", "hello", "?"):
-        print("[ROUTING] Using keyword: help", file=sys.stderr)
-        return _keyword_result(cmd_help())
-
-    if text in ("total spending", "total spend", "total debits", "total"):
-        return _keyword_result(cmd_total_spending())
-
-    if text in ("income", "credits", "total income", "salary", "total credits"):
-        return _keyword_result(cmd_income())
-
+def handle_account_balance(message: str, confidence: float) -> dict:
+    """Handle balance check requests."""
+    # Check if it's a simple balance query
+    text = message.strip().lower()
     if text in ("balance", "closing balance", "current balance"):
         return _keyword_result(cmd_balance())
+    # Otherwise use LLM for nuanced balance questions
+    result = ask_llm(message)
+    result["used_llm"] = True
+    return result
+
+
+def handle_spending_query(message: str, confidence: float) -> dict:
+    """Handle spending-related queries."""
+    text = message.strip().lower()
+
+    # Check for exact keyword matches first
+    if text in ("total spending", "total spend", "total debits", "total"):
+        return _keyword_result(cmd_total_spending())
 
     if text in ("top merchants", "top spend", "top", "biggest", "top 10"):
         return _keyword_result(cmd_top_merchants())
 
-    # Month keywords (exact matches only)
+    # Check for month keywords
     for keyword, month_num in MONTH_KEYWORDS.items():
         if keyword == text or text == f"{keyword} spending":
             return _keyword_result(cmd_month_spending(month_num))
 
-    # For natural language questions (more than 3 words or contains question words), use LLM
-    if word_count > 3 or "?" in text or any(
-        word in text for word in ["how", "what", "when", "where", "why", "much", "many", "did", "do", "can"]
-    ):
-        print("[ROUTING] Using LLM (natural language detected)", file=sys.stderr)
-        result = ask_llm(body.strip())
-        result["used_llm"] = True
-        return result
-
-    # Try merchant keyword search (only for short queries)
-    if word_count <= 3:
+    # Try merchant search for short queries
+    words = text.split()
+    if len(words) <= 3:
         merchant_result = cmd_merchant_search(text)
         if not merchant_result.startswith("No transactions found"):
-            print("[ROUTING] Using keyword: merchant search", file=sys.stderr)
-            return {"content": merchant_result, "used_llm": False}
+            return {"content": merchant_result, "used_llm": False, "intent": "spending_query", "confidence": confidence}
 
-    # Fallback: ask the LLM
-    print("[ROUTING] Using LLM (fallback)", file=sys.stderr)
-    result = ask_llm(body.strip())
+    # Use LLM for complex spending queries
+    result = ask_llm(message)
     result["used_llm"] = True
+    return result
+
+
+def handle_debt_advice(message: str, confidence: float) -> dict:
+    """Handle debt and credit-related advice."""
+    # Use LLM with financial context
+    result = ask_llm(message)
+    result["used_llm"] = True
+    return result
+
+
+def handle_budget_check(message: str, confidence: float) -> dict:
+    """Handle budget and affordability checks."""
+    # Use LLM for budget analysis
+    result = ask_llm(message)
+    result["used_llm"] = True
+    return result
+
+
+def handle_document_upload(message: str, confidence: float) -> dict:
+    """Handle document upload requests."""
+    return {
+        "content": (
+            "📄 *Document Upload*\n\n"
+            "To upload a bank statement:\n"
+            "1. Go to the upload page (coming soon)\n"
+            "2. Or send your PDF to our support team\n\n"
+            "For now, please contact support for manual uploads."
+        ),
+        "used_llm": False,
+        "intent": "document_upload",
+        "confidence": confidence
+    }
+
+
+def handle_general_financial_advice(message: str, confidence: float) -> dict:
+    """Handle general financial advice requests."""
+    # Use LLM for financial advice
+    result = ask_llm(message)
+    result["used_llm"] = True
+    return result
+
+
+def handle_unknown(message: str, confidence: float) -> dict:
+    """Handle unknown intents - fallback to LLM or help."""
+    # If message is very short, suggest help
+    if len(message.strip()) < 5:
+        return _keyword_result(cmd_help())
+
+    # Otherwise try LLM
+    result = ask_llm(message)
+    result["used_llm"] = True
+    return result
+
+
+# Intent router mapping
+INTENT_HANDLERS = {
+    Intent.GREETING: handle_greeting,
+    Intent.ACCOUNT_BALANCE: handle_account_balance,
+    Intent.SPENDING_QUERY: handle_spending_query,
+    Intent.DEBT_ADVICE: handle_debt_advice,
+    Intent.BUDGET_CHECK: handle_budget_check,
+    Intent.DOCUMENT_UPLOAD: handle_document_upload,
+    Intent.GENERAL_FINANCIAL_ADVICE: handle_general_financial_advice,
+    Intent.UNKNOWN: handle_unknown,
+}
+
+
+def handle_message(body: str) -> dict:
+    """
+    Route an incoming message using intent classification.
+
+    Returns a result dict with: content, used_llm, intent, confidence
+    """
+    text = body.strip()
+
+    # Classify intent
+    intent, confidence, reasoning = IntentClassifier.classify(text)
+
+    print(
+        f"[INTENT] Detected: {intent.value} | Confidence: {confidence:.2f} | Reason: {reasoning}",
+        file=sys.stderr
+    )
+
+    # Handle low confidence - ask for clarification
+    if confidence < IntentClassifier.CONFIDENCE_THRESHOLD_LOW:
+        print(f"[INTENT] Low confidence ({confidence:.2f}), asking for clarification", file=sys.stderr)
+        return {
+            "content": (
+                "I'm not sure I understood that. Could you rephrase?\n\n"
+                "Try:\n"
+                "• *total* - see total spending\n"
+                "• *balance* - check account balance\n"
+                "• *uber* - spending at Uber\n"
+                "• *help* - see all commands"
+            ),
+            "used_llm": False,
+            "intent": intent.value,
+            "confidence": confidence,
+        }
+
+    # Route to appropriate handler
+    handler = INTENT_HANDLERS.get(intent, handle_unknown)
+    result = handler(text, confidence)
+
+    # Add intent metadata to result
+    result["intent"] = intent.value
+    result["confidence"] = confidence
+
     return result
 
 
@@ -575,8 +686,10 @@ def _log_metric(
     total_time: float,
     success: bool,
     tokens: int,
+    intent: str | None = None,
+    confidence: float | None = None,
 ) -> None:
-    """Log interaction metrics to Supabase."""
+    """Log interaction metrics to Supabase with intent classification data."""
     try:
         # Get or create user
         user_response = (
@@ -606,17 +719,23 @@ def _log_metric(
             user_id = user_response.data[0]["id"]
 
         # Insert metric
-        supabase.table("metrics").insert(
-            {
-                "user_id": user_id,
-                "message_text": message_text,
-                "used_llm": used_llm,
-                "llm_response_time": llm_time,
-                "total_response_time": round(total_time, 3),
-                "success": success,
-                "tokens_used": tokens,
-            }
-        ).execute()
+        metric_data = {
+            "user_id": user_id,
+            "message_text": message_text,
+            "used_llm": used_llm,
+            "llm_response_time": llm_time,
+            "total_response_time": round(total_time, 3),
+            "success": success,
+            "tokens_used": tokens,
+        }
+
+        # Add intent classification data if available
+        if intent:
+            metric_data["intent"] = intent
+        if confidence is not None:
+            metric_data["confidence"] = confidence
+
+        supabase.table("metrics").insert(metric_data).execute()
 
     except Exception as e:
         # Log error but don't fail the webhook response
@@ -651,6 +770,8 @@ def webhook():
             total_time=total_time,
             success=not result.get("error", False),
             tokens=result.get("tokens", 0),
+            intent=result.get("intent"),
+            confidence=result.get("confidence"),
         )
 
         resp = MessagingResponse()
