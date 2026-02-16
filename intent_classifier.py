@@ -25,16 +25,18 @@ class Intent(Enum):
 class IntentClassifier:
     """Hybrid intent classifier using rule-based + LLM fallback."""
 
-    # Rule-based patterns for each intent
+    # Rule-based patterns for each intent with max response lengths
     INTENT_PATTERNS = {
         Intent.GREETING: {
             "keywords": ["hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening", "help"],
             "exact_matches": ["hi", "hello", "hey", "sup", "yo", "help"],
+            "max_words": 20,  # Short, friendly
         },
         Intent.ACCOUNT_BALANCE: {
             "keywords": ["balance", "how much", "money left", "remaining", "account", "available", "income", "credits"],
             "exact_matches": ["balance", "closing balance", "current balance", "income"],
             "patterns": ["how much.*left", "how much.*have", "what.*balance", "total.*income", "how much.*income"],
+            "max_words": 30,  # Just the number + context
         },
         Intent.SPENDING_QUERY: {
             "keywords": [
@@ -54,24 +56,32 @@ class IntentClassifier:
                 "how much.*spent", "what.*spent", ".*spending", "spent.*on",
                 "how much.*at", "spent.*at", ".*merchant",
             ],
+            "max_words": 40,  # Amount + brief insight
         },
         Intent.DEBT_ADVICE: {
             "keywords": ["debt", "owe", "loan", "credit", "borrow", "repay", "overdraft", "owing"],
             "patterns": ["how.*pay.*debt", "reduce.*debt", "debt.*advice", "manage.*debt"],
+            "max_words": 80,  # Needs more context and guidance
         },
         Intent.BUDGET_CHECK: {
             "keywords": ["budget", "afford", "save", "savings", "limit", "over budget"],
             "patterns": ["can.*afford", "within.*budget", "budget.*check", "over.*budget"],
+            "max_words": 50,  # Status + one recommendation
         },
         Intent.DOCUMENT_UPLOAD: {
             "keywords": ["upload", "statement", "document", "pdf", "file", "attach"],
             "patterns": ["upload.*statement", "send.*statement", "attach.*document"],
+            "max_words": 20,  # Confirmation only
         },
         Intent.GENERAL_FINANCIAL_ADVICE: {
             "keywords": ["advice", "recommend", "should i", "invest", "financial", "tips"],
             "patterns": ["what.*should.*do", "how.*improve", "advice.*on", ".*recommend"],
+            "max_words": 80,  # Conversational but concise
         },
     }
+
+    # Default max words for unknown intent
+    DEFAULT_MAX_WORDS = 30
 
     CONFIDENCE_THRESHOLD_HIGH = 0.85
     CONFIDENCE_THRESHOLD_LOW = 0.4
@@ -98,6 +108,45 @@ class IntentClassifier:
             intent, confidence, reasoning = cls._llm_classify(message)
 
         return intent, confidence, reasoning
+
+    @classmethod
+    def get_max_words(cls, intent: Intent) -> int:
+        """Get the maximum word limit for a given intent."""
+        pattern = cls.INTENT_PATTERNS.get(intent)
+        if pattern and "max_words" in pattern:
+            return pattern["max_words"]
+        return cls.DEFAULT_MAX_WORDS
+
+    @staticmethod
+    def truncate_response(text: str, max_words: int) -> str:
+        """
+        Truncate response to max words while preserving sentence structure.
+
+        Args:
+            text: The response text to truncate
+            max_words: Maximum number of words allowed
+
+        Returns:
+            Truncated text with "..." appended if truncated
+        """
+        words = text.split()
+        if len(words) <= max_words:
+            return text
+
+        # Truncate and add ellipsis
+        truncated = " ".join(words[:max_words])
+
+        # Try to end at a sentence boundary if possible
+        last_period = truncated.rfind(".")
+        last_exclaim = truncated.rfind("!")
+        last_question = truncated.rfind("?")
+        last_punct = max(last_period, last_exclaim, last_question)
+
+        if last_punct > len(truncated) * 0.7:  # If we're past 70%, use that sentence
+            return truncated[:last_punct + 1]
+
+        # Otherwise just truncate with ellipsis
+        return truncated.rstrip(".,;:") + "..."
 
     @classmethod
     def _rule_based_classify(cls, text: str) -> Tuple[Intent, float, str]:

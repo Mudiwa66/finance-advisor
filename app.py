@@ -161,11 +161,20 @@ def build_spending_summary() -> str:
     )
 
 
-def ask_llm(question: str) -> dict:
-    """Send a question to Gemini. Returns dict with content, timing, tokens."""
+def ask_llm(question: str, max_words: int = 50) -> dict:
+    """
+    Send a question to Gemini with word limit enforcement.
+
+    Args:
+        question: User's question
+        max_words: Maximum words allowed in response (default: 50)
+
+    Returns:
+        dict with content, timing, tokens
+    """
     start = time.monotonic()
 
-    print(f"[LLM] Called with question: '{question[:50]}...'", file=sys.stderr)
+    print(f"[LLM] Called with question: '{question[:50]}...' (max_words: {max_words})", file=sys.stderr)
 
     if not client or not GEMINI_API_KEY:
         # Fallback if no API token
@@ -182,8 +191,13 @@ def ask_llm(question: str) -> dict:
         }
 
     try:
-        # Build prompt with context
-        prompt = f"{SPENDING_SUMMARY}\n\nUser question: {question}"
+        # Build prompt with context and word limit instruction
+        prompt = (
+            f"{SPENDING_SUMMARY}\n\n"
+            f"User question: {question}\n\n"
+            f"IMPORTANT: Keep your response under {max_words} words. "
+            f"This is WhatsApp - be concise and text-like, not essay-like."
+        )
 
         # Call Gemini API using new google-genai package
         # Note: model name should be just the model ID, SDK handles the full path
@@ -490,7 +504,8 @@ def handle_account_balance(message: str, confidence: float) -> dict:
     if text in ("balance", "closing balance", "current balance"):
         return _keyword_result(cmd_balance())
     # Otherwise use LLM for nuanced balance questions
-    result = ask_llm(message)
+    max_words = IntentClassifier.get_max_words(Intent.ACCOUNT_BALANCE)
+    result = ask_llm(message, max_words=max_words)
     result["used_llm"] = True
     return result
 
@@ -519,7 +534,8 @@ def handle_spending_query(message: str, confidence: float) -> dict:
             return {"content": merchant_result, "used_llm": False, "intent": "spending_query", "confidence": confidence}
 
     # Use LLM for complex spending queries
-    result = ask_llm(message)
+    max_words = IntentClassifier.get_max_words(Intent.SPENDING_QUERY)
+    result = ask_llm(message, max_words=max_words)
     result["used_llm"] = True
     return result
 
@@ -527,7 +543,8 @@ def handle_spending_query(message: str, confidence: float) -> dict:
 def handle_debt_advice(message: str, confidence: float) -> dict:
     """Handle debt and credit-related advice."""
     # Use LLM with financial context
-    result = ask_llm(message)
+    max_words = IntentClassifier.get_max_words(Intent.DEBT_ADVICE)
+    result = ask_llm(message, max_words=max_words)
     result["used_llm"] = True
     return result
 
@@ -535,7 +552,8 @@ def handle_debt_advice(message: str, confidence: float) -> dict:
 def handle_budget_check(message: str, confidence: float) -> dict:
     """Handle budget and affordability checks."""
     # Use LLM for budget analysis
-    result = ask_llm(message)
+    max_words = IntentClassifier.get_max_words(Intent.BUDGET_CHECK)
+    result = ask_llm(message, max_words=max_words)
     result["used_llm"] = True
     return result
 
@@ -543,13 +561,7 @@ def handle_budget_check(message: str, confidence: float) -> dict:
 def handle_document_upload(message: str, confidence: float) -> dict:
     """Handle document upload requests."""
     return {
-        "content": (
-            "📄 *Document Upload*\n\n"
-            "To upload a bank statement:\n"
-            "1. Go to the upload page (coming soon)\n"
-            "2. Or send your PDF to our support team\n\n"
-            "For now, please contact support for manual uploads."
-        ),
+        "content": "📄 Document upload coming soon! Contact support for manual uploads.",
         "used_llm": False,
         "intent": "document_upload",
         "confidence": confidence
@@ -559,7 +571,8 @@ def handle_document_upload(message: str, confidence: float) -> dict:
 def handle_general_financial_advice(message: str, confidence: float) -> dict:
     """Handle general financial advice requests."""
     # Use LLM for financial advice
-    result = ask_llm(message)
+    max_words = IntentClassifier.get_max_words(Intent.GENERAL_FINANCIAL_ADVICE)
+    result = ask_llm(message, max_words=max_words)
     result["used_llm"] = True
     return result
 
@@ -570,8 +583,9 @@ def handle_unknown(message: str, confidence: float) -> dict:
     if len(message.strip()) < 5:
         return _keyword_result(cmd_help())
 
-    # Otherwise try LLM
-    result = ask_llm(message)
+    # Otherwise try LLM with default limit
+    max_words = IntentClassifier.DEFAULT_MAX_WORDS
+    result = ask_llm(message, max_words=max_words)
     result["used_llm"] = True
     return result
 
@@ -609,14 +623,7 @@ def handle_message(body: str) -> dict:
     if confidence < IntentClassifier.CONFIDENCE_THRESHOLD_LOW:
         print(f"[INTENT] Low confidence ({confidence:.2f}), asking for clarification", file=sys.stderr)
         return {
-            "content": (
-                "I'm not sure I understood that. Could you rephrase?\n\n"
-                "Try:\n"
-                "• *total* - see total spending\n"
-                "• *balance* - check account balance\n"
-                "• *uber* - spending at Uber\n"
-                "• *help* - see all commands"
-            ),
+            "content": "Not sure what you meant. Try: *total*, *balance*, *top*, *march*, *uber*, or *help*",
             "used_llm": False,
             "intent": intent.value,
             "confidence": confidence,
@@ -629,6 +636,10 @@ def handle_message(body: str) -> dict:
     # Add intent metadata to result
     result["intent"] = intent.value
     result["confidence"] = confidence
+
+    # Enforce word limit on response
+    max_words = IntentClassifier.get_max_words(intent)
+    result["content"] = IntentClassifier.truncate_response(result["content"], max_words)
 
     return result
 
