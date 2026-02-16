@@ -19,7 +19,7 @@ load_dotenv()
 
 # LLM Configuration - Use Google Gemini API
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()  # Clean whitespace/tabs
 
 # Try to import and configure Gemini (using new google-genai package)
 client = None
@@ -198,6 +198,9 @@ def ask_llm(question: str, max_words: int = 50) -> dict:
             f"IMPORTANT: Keep your response under {max_words} words. "
             f"This is WhatsApp - be concise and text-like, not essay-like."
         )
+
+        # Clean prompt: remove tabs and non-printable characters
+        prompt = prompt.replace("\t", "    ")  # Replace tabs with spaces
 
         # Call Gemini API using new google-genai package
         # Note: model name should be just the model ID, SDK handles the full path
