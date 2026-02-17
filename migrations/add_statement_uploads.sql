@@ -20,6 +20,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_statement_uploads_unique
 CREATE INDEX IF NOT EXISTS idx_statement_uploads_user
     ON statement_uploads(user_id, uploaded_at DESC);
 
+-- Deduplicate existing transactions before adding unique index
+-- Keeps the row with the lowest ctid (first inserted) for each duplicate group
+DELETE FROM transactions
+WHERE ctid NOT IN (
+    SELECT min(ctid)
+    FROM transactions
+    GROUP BY user_id, date, description, amount
+);
+
 -- Allow upsert on transactions to handle re-uploads gracefully
 -- (unique index acts as a constraint for ON CONFLICT)
 CREATE UNIQUE INDEX IF NOT EXISTS uq_transaction
