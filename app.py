@@ -17,6 +17,10 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 load_dotenv()
 
+# Twilio credentials (needed to download media from WhatsApp)
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
 # LLM Configuration - Use Groq API
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL_MAIN = "llama-3.3-70b-versatile"  # For financial advice and complex questions
@@ -467,6 +471,7 @@ def cmd_merchant_search(query: str) -> str:
 # ---------------------------------------------------------------------------
 
 from intent_classifier import Intent, IntentClassifier
+from pdf_processor import process_pdf_upload
 
 # Wire up Groq fast model for LLM-based intent classification fallback
 IntentClassifier.setup_llm(groq_client, GROQ_MODEL_FAST)
@@ -747,10 +752,51 @@ def webhook():
     start = time.monotonic()
 
     try:
-        incoming_msg = request.form.get("Body", "").strip()
         user_phone = request.form.get("From", "anonymous")
         user_hash = _hash_user(user_phone)
+        num_media = int(request.form.get("NumMedia", 0))
 
+        # --- PDF upload path ---
+        if num_media > 0:
+            media_url = request.form.get("MediaUrl0", "")
+            media_type = request.form.get("MediaContentType0", "")
+            print(f"[WEBHOOK] Media received from {user_hash[:8]}: {media_type}", file=sys.stderr)
+
+            # Send immediate acknowledgement
+            ack = MessagingResponse()
+            ack.message("⏳ Processing your statement, please wait...")
+            # Note: we still process synchronously; ack is sent as the response
+            # For true async we'd need a background worker - this is good enough for now
+
+            pdf_result = process_pdf_upload(
+                supabase=supabase,
+                media_url=media_url,
+                media_content_type=media_type,
+                phone_hash=user_hash,
+                account_sid=TWILIO_ACCOUNT_SID,
+                auth_token=TWILIO_AUTH_TOKEN,
+            )
+
+            total_time = time.monotonic() - start
+            _log_metric(
+                user_hash=user_hash,
+                message_text=f"[PDF UPLOAD] {media_type}",
+                used_llm=False,
+                llm_time=None,
+                total_time=total_time,
+                success=pdf_result["success"],
+                tokens=0,
+                intent="document_upload",
+                confidence=1.0,
+            )
+
+            resp = MessagingResponse()
+            resp.message(pdf_result["message"])
+            print(f"[WEBHOOK] PDF result: {pdf_result['message'][:80]}", file=sys.stderr)
+            return str(resp), 200, {"Content-Type": "application/xml"}
+
+        # --- Text message path ---
+        incoming_msg = request.form.get("Body", "").strip()
         print(f"[WEBHOOK] Received message from {user_hash[:8]}: '{incoming_msg[:50]}'", file=sys.stderr)
 
         result = handle_message(incoming_msg)
@@ -778,7 +824,6 @@ def webhook():
         import traceback
         traceback.print_exc()
 
-        # Return error message to user
         resp = MessagingResponse()
         resp.message("Sorry, an error occurred. Please try again or type *help*.")
         return str(resp), 200, {"Content-Type": "application/xml"}
