@@ -21,7 +21,6 @@ CREATE INDEX IF NOT EXISTS idx_statement_uploads_user
     ON statement_uploads(user_id, uploaded_at DESC);
 
 -- Allow upsert on transactions to handle re-uploads gracefully
--- (transactions table needs a unique constraint on user_id + date + description + amount)
-ALTER TABLE transactions
-    ADD CONSTRAINT IF NOT EXISTS uq_transaction
-    UNIQUE (user_id, date, description, amount);
+-- (unique index acts as a constraint for ON CONFLICT)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_transaction
+    ON transactions(user_id, date, description, amount);
