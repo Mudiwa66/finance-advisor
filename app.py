@@ -19,7 +19,7 @@ load_dotenv()
 
 # LLM Configuration - Use Groq API
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL_MAIN = "llama-3.1-70b-versatile"  # For financial advice and complex questions
+GROQ_MODEL_MAIN = "llama-3.3-70b-versatile"  # For financial advice and complex questions
 GROQ_MODEL_FAST = "llama-3.1-8b-instant"     # For intent classification (faster)
 
 # Try to import and configure Groq
