@@ -86,6 +86,16 @@ class IntentClassifier:
     CONFIDENCE_THRESHOLD_HIGH = 0.85
     CONFIDENCE_THRESHOLD_LOW = 0.4
 
+    # Groq client for LLM-based classification (set via setup_llm)
+    _llm_client = None
+    _llm_model = None
+
+    @classmethod
+    def setup_llm(cls, client, model: str) -> None:
+        """Configure Groq client for LLM-based intent classification fallback."""
+        cls._llm_client = client
+        cls._llm_model = model
+
     @classmethod
     def classify(cls, message: str) -> Tuple[Intent, float, str]:
         """
@@ -102,10 +112,11 @@ class IntentClassifier:
         # Try rule-based classification first
         intent, confidence, reasoning = cls._rule_based_classify(text)
 
-        # If confidence is medium/low, optionally use LLM for disambiguation
-        # (Currently disabled for speed - can enable if needed)
-        if confidence < cls.CONFIDENCE_THRESHOLD_HIGH and False:  # Set to True to enable LLM
-            intent, confidence, reasoning = cls._llm_classify(message)
+        # For low-confidence cases, use the fast LLM model to disambiguate
+        if confidence < cls.CONFIDENCE_THRESHOLD_LOW:
+            llm_intent, llm_confidence, llm_reasoning = cls._llm_classify(message)
+            if llm_confidence > confidence:
+                intent, confidence, reasoning = llm_intent, llm_confidence, llm_reasoning
 
         return intent, confidence, reasoning
 
@@ -192,8 +203,31 @@ class IntentClassifier:
 
     @classmethod
     def _llm_classify(cls, message: str) -> Tuple[Intent, float, str]:
-        """Use LLM for intent classification (fallback for ambiguous cases)."""
-        # This would call Gemini to classify the intent
-        # For now, return unknown with medium confidence
-        # TODO: Implement LLM-based classification if needed
-        return Intent.UNKNOWN, 0.5, "LLM classification not implemented"
+        """Use Groq llama-3.1-8b-instant to classify ambiguous intents."""
+        if cls._llm_client is None or cls._llm_model is None:
+            return Intent.UNKNOWN, 0.5, "LLM classification not configured"
+
+        intent_names = [i.value for i in Intent if i != Intent.UNKNOWN]
+        prompt = (
+            f"Classify this financial chatbot message into exactly one intent.\n"
+            f"Message: '{message}'\n"
+            f"Intents: {', '.join(intent_names)}\n"
+            f"Reply with ONLY the intent name, nothing else."
+        )
+
+        try:
+            response = cls._llm_client.chat.completions.create(
+                model=cls._llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=20,
+                temperature=0,
+            )
+            intent_str = response.choices[0].message.content.strip().lower()
+
+            for intent in Intent:
+                if intent.value == intent_str or intent.value.replace("_", " ") in intent_str:
+                    return intent, 0.75, f"LLM classified as: {intent_str}"
+
+            return Intent.UNKNOWN, 0.5, f"LLM returned unrecognized: {intent_str}"
+        except Exception as e:
+            return Intent.UNKNOWN, 0.5, f"LLM classification error: {e}"

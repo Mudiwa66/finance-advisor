@@ -17,30 +17,32 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 load_dotenv()
 
-# LLM Configuration - Use Google Gemini API
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()  # Clean whitespace/tabs
+# LLM Configuration - Use Groq API
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL_MAIN = "llama-3.1-70b-versatile"  # For financial advice and complex questions
+GROQ_MODEL_FAST = "llama-3.1-8b-instant"     # For intent classification (faster)
 
-# Try to import and configure Gemini (using new google-genai package)
-client = None
+# Try to import and configure Groq
+groq_client = None
 try:
-    from google import genai
-    if GEMINI_API_KEY:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        print("[LLM CONFIG] Gemini client configured successfully", file=sys.stderr)
+    from groq import Groq
+    if GROQ_API_KEY:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+        print("[LLM CONFIG] Groq client configured successfully", file=sys.stderr)
     else:
-        print("[LLM CONFIG] Gemini API Key: NOT SET", file=sys.stderr)
+        print("[LLM CONFIG] Groq API Key: NOT SET", file=sys.stderr)
 except ImportError as e:
-    print(f"[LLM CONFIG] Failed to import google.genai: {e}", file=sys.stderr)
+    print(f"[LLM CONFIG] Failed to import groq: {e}", file=sys.stderr)
     print("[LLM CONFIG] LLM features will be disabled", file=sys.stderr)
 except Exception as e:
-    print(f"[LLM CONFIG] Error configuring Gemini: {e}", file=sys.stderr)
-    client = None
+    print(f"[LLM CONFIG] Error configuring Groq: {e}", file=sys.stderr)
+    groq_client = None
 
 # Debug logging for LLM configuration
-print(f"[LLM CONFIG] Gemini API Key: {'SET' if GEMINI_API_KEY else 'NOT SET'}", file=sys.stderr)
-print(f"[LLM CONFIG] Gemini Model: {GEMINI_MODEL}", file=sys.stderr)
-print(f"[LLM CONFIG] Client object: {'READY' if client else 'NOT READY'}", file=sys.stderr)
+print(f"[LLM CONFIG] Groq API Key: {'SET' if GROQ_API_KEY else 'NOT SET'}", file=sys.stderr)
+print(f"[LLM CONFIG] Main Model: {GROQ_MODEL_MAIN}", file=sys.stderr)
+print(f"[LLM CONFIG] Fast Model: {GROQ_MODEL_FAST}", file=sys.stderr)
+print(f"[LLM CONFIG] Client object: {'READY' if groq_client else 'NOT READY'}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Supabase configuration
@@ -163,7 +165,7 @@ def build_spending_summary() -> str:
 
 def ask_llm(question: str, max_words: int = 50) -> dict:
     """
-    Send a question to Gemini with word limit enforcement.
+    Send a question to Groq with word limit enforcement.
 
     Args:
         question: User's question
@@ -176,9 +178,9 @@ def ask_llm(question: str, max_words: int = 50) -> dict:
 
     print(f"[LLM] Called with question: '{question[:50]}...' (max_words: {max_words})", file=sys.stderr)
 
-    if not client or not GEMINI_API_KEY:
+    if not groq_client or not GROQ_API_KEY:
         # Fallback if no API token
-        print("[LLM ERROR] GEMINI_API_KEY not set!", file=sys.stderr)
+        print("[LLM ERROR] GROQ_API_KEY not set!", file=sys.stderr)
         elapsed = time.monotonic() - start
         return {
             "content": (
@@ -199,36 +201,18 @@ def ask_llm(question: str, max_words: int = 50) -> dict:
             f"This is WhatsApp - be concise and text-like, not essay-like."
         )
 
-        # Clean prompt: remove tabs and non-printable characters
-        prompt = prompt.replace("\t", "    ")  # Replace tabs with spaces
-
-        # Call Gemini API using new google-genai package
-        # Note: model name should be just the model ID, SDK handles the full path
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,  # e.g. "gemini-1.5-flash"
-            contents=prompt,
+        # Call Groq API
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL_MAIN,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_words * 2,
         )
 
         elapsed = time.monotonic() - start
 
-        # Extract response text (safely handle blocked/filtered responses)
-        try:
-            text_content = response.text
-            if text_content:
-                content = text_content.strip()
-                # Estimate tokens (Gemini uses different tokenization, rough estimate)
-                tokens = len(content) // 4
-                print(f"[LLM] Success! Response length: {len(content)} chars", file=sys.stderr)
-            else:
-                content = "No response from model"
-                tokens = 0
-                print("[LLM] No text in response", file=sys.stderr)
-        except Exception as text_error:
-            # Accessing response.text can fail if response is blocked by safety filters
-            print(f"[LLM ERROR] Failed to access response.text: {text_error}", file=sys.stderr)
-            print(f"[LLM ERROR] Response object: {response}", file=sys.stderr)
-            content = "Response blocked by content filters. Try rephrasing your question or use a keyword like *total*, *uber*, *march*."
-            tokens = 0
+        content = response.choices[0].message.content.strip()
+        tokens = response.usage.total_tokens if response.usage else len(content) // 4
+        print(f"[LLM] Success! Response length: {len(content)} chars, tokens: {tokens}", file=sys.stderr)
 
         return {
             "content": content,
@@ -484,6 +468,9 @@ def cmd_merchant_search(query: str) -> str:
 
 from intent_classifier import Intent, IntentClassifier
 
+# Wire up Groq fast model for LLM-based intent classification fallback
+IntentClassifier.setup_llm(groq_client, GROQ_MODEL_FAST)
+
 
 # ---------------------------------------------------------------------------
 # Message router
@@ -666,7 +653,7 @@ def health_check():
         "status": "ok",
         "service": "whatsapp-financial-advisor",
         "transactions_loaded": len(TRANSACTIONS),
-        "llm_configured": client is not None,
+        "llm_configured": groq_client is not None,
     }
 
 
