@@ -2,12 +2,12 @@
 """Flask webhook for answering spending questions via WhatsApp (Twilio)."""
 
 import hashlib
+import json
 import os
 import random
 import re
 import sys
 import time
-from calendar import monthrange
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -25,8 +25,7 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 # LLM Configuration - Use Groq API
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL_MAIN = "llama-3.3-70b-versatile"  # For financial advice and complex questions
-GROQ_MODEL_FAST = "llama-3.1-8b-instant"     # For intent classification (faster)
+GROQ_MODEL_MAIN = "llama-3.3-70b-versatile"
 
 # Try to import and configure Groq
 groq_client = None
@@ -44,10 +43,8 @@ except Exception as e:
     print(f"[LLM CONFIG] Error configuring Groq: {e}", file=sys.stderr)
     groq_client = None
 
-# Debug logging for LLM configuration
 print(f"[LLM CONFIG] Groq API Key: {'SET' if GROQ_API_KEY else 'NOT SET'}", file=sys.stderr)
 print(f"[LLM CONFIG] Main Model: {GROQ_MODEL_MAIN}", file=sys.stderr)
-print(f"[LLM CONFIG] Fast Model: {GROQ_MODEL_FAST}", file=sys.stderr)
 print(f"[LLM CONFIG] Client object: {'READY' if groq_client else 'NOT READY'}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
@@ -57,7 +54,6 @@ print(f"[LLM CONFIG] Client object: {'READY' if groq_client else 'NOT READY'}", 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Debug logging for Railway deployment
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("ERROR: Missing Supabase environment variables!", file=sys.stderr)
     print(f"SUPABASE_URL: {'SET' if SUPABASE_URL else 'NOT SET'}", file=sys.stderr)
@@ -93,172 +89,12 @@ def _load_user_transactions(user_id: str) -> list[dict]:
         return []
 
 
-# For backward compatibility, load default user's transactions at startup
-# TODO: Replace with actual user_id from migration script output
 DEFAULT_USER_ID = os.getenv("DEFAULT_USER_ID", "REPLACE_WITH_USER_ID_FROM_MIGRATION")
 print(f"[STARTUP] DEFAULT_USER_ID: {DEFAULT_USER_ID}", file=sys.stderr)
 TRANSACTIONS: list[dict] = _load_user_transactions(DEFAULT_USER_ID)
 
 if not TRANSACTIONS:
     print("[STARTUP WARNING] No transactions loaded! LLM will have no spending data.", file=sys.stderr)
-
-# ---------------------------------------------------------------------------
-# Ollama LLM integration
-# ---------------------------------------------------------------------------
-
-
-def build_spending_summary() -> str:
-    """Pre-compute a text summary of all transactions for the LLM system prompt."""
-    # Handle empty transactions gracefully
-    if not TRANSACTIONS:
-        return (
-            "You are a helpful financial assistant for a South African FNB bank account.\n"
-            "No transaction data is currently loaded. Please try again later or contact support."
-        )
-
-    total_debits = sum(t["amount"] for t in TRANSACTIONS if t["amount"] < 0)
-    total_credits = sum(t["amount"] for t in TRANSACTIONS if t["amount"] > 0)
-    debit_count = sum(1 for t in TRANSACTIONS if t["amount"] < 0)
-    credit_count = sum(1 for t in TRANSACTIONS if t["amount"] > 0)
-    closing_balance = TRANSACTIONS[-1]["balance"]
-    first_date = TRANSACTIONS[0]["date"]
-    last_date = TRANSACTIONS[-1]["date"]
-
-    # Top 15 merchants
-    spending: Counter[str] = Counter()
-    counts: Counter[str] = Counter()
-    for t in TRANSACTIONS:
-        if t["amount"] < 0:
-            m = extract_merchant(t["description"])
-            spending[m] += abs(t["amount"])
-            counts[m] += 1
-
-    top_merchants = "\n".join(
-        f"  - {m}: R{amt:,.2f} ({counts[m]} transactions)" for m, amt in spending.most_common(15)
-    )
-
-    # Monthly breakdown
-    monthly: dict[str, dict] = {}
-    for t in TRANSACTIONS:
-        month_key = t["date"][:7]  # "2024-02"
-        if month_key not in monthly:
-            monthly[month_key] = {"debits": 0.0, "credits": 0.0, "count": 0}
-        monthly[month_key]["count"] += 1
-        if t["amount"] < 0:
-            monthly[month_key]["debits"] += t["amount"]
-        else:
-            monthly[month_key]["credits"] += t["amount"]
-
-    month_lines = "\n".join(
-        f"  - {k}: spent R{abs(v['debits']):,.2f}, income R{v['credits']:,.2f} ({v['count']} txns)"
-        for k, v in sorted(monthly.items())
-    )
-
-    return (
-        f"You are a helpful financial assistant for a South African FNB bank account.\n"
-        f"Statement period: {first_date} to {last_date}\n"
-        f"Currency: South African Rand (ZAR), displayed as R.\n\n"
-        f"ACCOUNT SUMMARY:\n"
-        f"  Total spending (debits): R{abs(total_debits):,.2f} ({debit_count} transactions)\n"
-        f"  Total income (credits): R{total_credits:,.2f} ({credit_count} transactions)\n"
-        f"  Closing balance: R{closing_balance:,.2f}\n\n"
-        f"TOP MERCHANTS:\n{top_merchants}\n\n"
-        f"MONTHLY BREAKDOWN:\n{month_lines}\n\n"
-        f"Answer concisely. Use the data above to answer spending questions. "
-        f"If you don't have enough info, say so. Keep replies under 300 words."
-    )
-
-
-def ask_llm(
-    question: str,
-    max_words: int = 50,
-    history: list[dict] | None = None,
-) -> dict:
-    """
-    Send a question to Groq with conversation history and word limit.
-
-    Args:
-        question:  Current user message
-        max_words: Maximum words in response
-        history:   List of {role, content} dicts from chat_history (oldest first)
-
-    Returns:
-        dict with content, timing, tokens
-    """
-    start = time.monotonic()
-
-    print(f"[LLM] question='{question[:50]}' max_words={max_words} history={len(history or [])} turns", file=sys.stderr)
-
-    if not groq_client or not GROQ_API_KEY:
-        print("[LLM ERROR] GROQ_API_KEY not set!", file=sys.stderr)
-        elapsed = time.monotonic() - start
-        return {
-            "content": (
-                "LLM is not configured. "
-                "Try a keyword like *total*, *uber*, *march*, or type *help*."
-            ),
-            "llm_time": round(elapsed, 3),
-            "tokens": 0,
-            "error": True,
-        }
-
-    try:
-        # System message: financial context + word limit instruction
-        system_msg = (
-            f"{SPENDING_SUMMARY}\n\n"
-            f"Keep responses under {max_words} words. "
-            "This is WhatsApp — be concise. "
-            "Use conversation history to resolve pronouns and follow-ups "
-            "('it', 'that', 'which one', 'what about last month')."
-        )
-
-        messages = [{"role": "system", "content": system_msg}]
-
-        # Inject conversation history so the LLM has context
-        if history:
-            messages.extend(history)
-
-        messages.append({"role": "user", "content": question})
-
-        # Call Groq API
-        response = groq_client.chat.completions.create(
-            model=GROQ_MODEL_MAIN,
-            messages=messages,
-            max_tokens=max_words * 2,
-        )
-
-        elapsed = time.monotonic() - start
-
-        content = response.choices[0].message.content.strip()
-        tokens = response.usage.total_tokens if response.usage else len(content) // 4
-        print(f"[LLM] Success! Response length: {len(content)} chars, tokens: {tokens}", file=sys.stderr)
-
-        return {
-            "content": content,
-            "llm_time": round(elapsed, 3),
-            "tokens": tokens,
-            "error": False,
-        }
-    except Exception as e:
-        elapsed = time.monotonic() - start
-        print(f"[LLM ERROR] Exception: {type(e).__name__}: {e}", file=sys.stderr)
-
-        # Handle specific errors
-        error_msg = str(e)
-        if "quota" in error_msg.lower() or "rate" in error_msg.lower():
-            user_msg = "Rate limit exceeded. Please try again in a moment."
-        elif "invalid" in error_msg.lower() and "key" in error_msg.lower():
-            user_msg = "API key is invalid. Please check your configuration."
-        else:
-            user_msg = "Sorry, I couldn't process that right now."
-
-        return {
-            "content": f"{user_msg} Try a keyword like *total*, *uber*, *march*, or type *help*.",
-            "llm_time": round(elapsed, 3),
-            "tokens": 0,
-            "error": True,
-        }
-
 
 # ---------------------------------------------------------------------------
 # Merchant extraction
@@ -312,7 +148,7 @@ def extract_merchant(description: str) -> str:
     for prefix in DESCRIPTION_PREFIXES:
         if text.startswith(prefix):
             matched_prefix = prefix
-            text = text[len(prefix) :].strip()
+            text = text[len(prefix):].strip()
             break
 
     text = CARD_RE.split(text)[0].strip()
@@ -327,133 +163,74 @@ def extract_merchant(description: str) -> str:
     return description[:40]
 
 
-# Pre-compute the summary now that extract_merchant is defined
+# ---------------------------------------------------------------------------
+# Spending summary (injected into LLM system prompt)
+# ---------------------------------------------------------------------------
+
+
+def build_spending_summary() -> str:
+    """Pre-compute a text summary of all transactions for the LLM system prompt."""
+    if not TRANSACTIONS:
+        return (
+            "You are a helpful financial assistant for a South African FNB bank account.\n"
+            "No transaction data is currently loaded. Please try again later or contact support."
+        )
+
+    total_debits = sum(t["amount"] for t in TRANSACTIONS if t["amount"] < 0)
+    total_credits = sum(t["amount"] for t in TRANSACTIONS if t["amount"] > 0)
+    debit_count = sum(1 for t in TRANSACTIONS if t["amount"] < 0)
+    credit_count = sum(1 for t in TRANSACTIONS if t["amount"] > 0)
+    closing_balance = TRANSACTIONS[-1]["balance"]
+    first_date = TRANSACTIONS[0]["date"]
+    last_date = TRANSACTIONS[-1]["date"]
+
+    spending: Counter[str] = Counter()
+    counts: Counter[str] = Counter()
+    for t in TRANSACTIONS:
+        if t["amount"] < 0:
+            m = extract_merchant(t["description"])
+            spending[m] += abs(t["amount"])
+            counts[m] += 1
+
+    top_merchants = "\n".join(
+        f"  - {m}: R{amt:,.2f} ({counts[m]} transactions)" for m, amt in spending.most_common(15)
+    )
+
+    monthly: dict[str, dict] = {}
+    for t in TRANSACTIONS:
+        month_key = t["date"][:7]
+        if month_key not in monthly:
+            monthly[month_key] = {"debits": 0.0, "credits": 0.0, "count": 0}
+        monthly[month_key]["count"] += 1
+        if t["amount"] < 0:
+            monthly[month_key]["debits"] += t["amount"]
+        else:
+            monthly[month_key]["credits"] += t["amount"]
+
+    month_lines = "\n".join(
+        f"  - {k}: spent R{abs(v['debits']):,.2f}, income R{v['credits']:,.2f} ({v['count']} txns)"
+        for k, v in sorted(monthly.items())
+    )
+
+    return (
+        f"You are a helpful financial assistant for a South African FNB bank account.\n"
+        f"Statement period: {first_date} to {last_date}\n"
+        f"Currency: South African Rand (ZAR), displayed as R.\n\n"
+        f"ACCOUNT SUMMARY:\n"
+        f"  Total spending (debits): R{abs(total_debits):,.2f} ({debit_count} transactions)\n"
+        f"  Total income (credits): R{total_credits:,.2f} ({credit_count} transactions)\n"
+        f"  Closing balance: R{closing_balance:,.2f}\n\n"
+        f"TOP MERCHANTS:\n{top_merchants}\n\n"
+        f"MONTHLY BREAKDOWN:\n{month_lines}\n\n"
+        f"Answer concisely. Use the data above to answer spending questions. "
+        f"If you don't have enough info, say so. Keep replies under 300 words."
+    )
+
+
 SPENDING_SUMMARY = build_spending_summary()
 
 # ---------------------------------------------------------------------------
-# Month helpers
-# ---------------------------------------------------------------------------
-
-MONTH_KEYWORDS = {
-    "january": "01",
-    "jan": "01",
-    "february": "02",
-    "feb": "02",
-    "march": "03",
-    "mar": "03",
-    "april": "04",
-    "apr": "04",
-    "may": "05",
-    "june": "06",
-    "jun": "06",
-    "july": "07",
-    "jul": "07",
-    "august": "08",
-    "aug": "08",
-    "september": "09",
-    "sep": "09",
-    "october": "10",
-    "oct": "10",
-    "november": "11",
-    "nov": "11",
-    "december": "12",
-    "dec": "12",
-}
-
-MONTH_NAMES = {
-    "01": "January",
-    "02": "February",
-    "03": "March",
-    "04": "April",
-    "05": "May",
-    "06": "June",
-    "07": "July",
-    "08": "August",
-    "09": "September",
-    "10": "October",
-    "11": "November",
-    "12": "December",
-}
-
-# ---------------------------------------------------------------------------
-# Date filtering helpers
-# ---------------------------------------------------------------------------
-
-_DATE_TOKEN_RE = re.compile(
-    r"\b(in|on|for|during|last|this|past|the|next|"
-    r"january|jan|february|feb|march|mar|april|apr|june|jun|"
-    r"july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec|"
-    r"weeks?|months?|years?|quarter|yesterday|today|ago|before|of|"
-    r"q[1-4]|first|second|third|fourth)\b"
-    r"|\b20\d{2}\b"
-    r"|\b\d+\s+days?\b"
-    # Word numbers only when directly followed by a time unit ("two weeks", "three months")
-    r"|\b(one|two|three|four|five|six|seven|eight|nine|ten)(?=\s+(?:week|month|day|year)s?\b)",
-    re.IGNORECASE,
-)
-# "may" excluded — too ambiguous (modal verb)
-
-
-def _filter_transactions(txns: list[dict], start: datetime, end: datetime) -> list[dict]:
-    """Return transactions within [start, end] inclusive."""
-    s = start.strftime("%Y-%m-%d")
-    e = end.strftime("%Y-%m-%d")
-    return [t for t in txns if s <= t["date"] <= e]
-
-
-def _date_label(start: datetime, end: datetime) -> str:
-    """Human-readable label for a date range, e.g. 'in March', 'last month'."""
-    today = datetime.now().date()
-    s, e = start.date(), end.date()
-
-    if s == e:
-        if s == today:
-            return "today"
-        if s == today - timedelta(days=1):
-            return "yesterday"
-        return f"on {s.strftime('%-d %b %Y')}"
-
-    # Full calendar month
-    if s.day == 1 and e.day == monthrange(e.year, e.month)[1] and s.month == e.month and s.year == e.year:
-        return f"in {s.strftime('%B')}" if s.year == today.year else f"in {s.strftime('%B %Y')}"
-
-    # Full calendar year
-    if s == s.replace(month=1, day=1) and e == e.replace(month=12, day=31) and s.year == e.year:
-        return f"in {s.year}"
-
-    # Relative to today
-    if e == today:
-        delta = (e - s).days + 1
-        if delta == 7:
-            return "in the past week"
-        if delta == 30:
-            return "in the past 30 days"
-        return f"in the past {delta} days"
-
-    return f"from {s.strftime('%-d %b')} to {e.strftime('%-d %b %Y')}"
-
-
-_FILLER_RE = re.compile(
-    r"\b(how|much|what|did|i|me|my|tell|show|give|about|is|are|was|were|"
-    r"do|does|have|had|can|get|see|total|all|any|of|at|a|an|the|spend|spending|and)\b",
-    re.IGNORECASE,
-)
-
-
-def _strip_date_tokens(text: str) -> str:
-    """Remove date-related words so 'uber in march' → 'uber'."""
-    cleaned = _DATE_TOKEN_RE.sub(" ", text)
-    return re.sub(r"\s{2,}", " ", cleaned).strip()
-
-
-def _extract_merchant_query(core: str) -> str:
-    """Strip filler question words from core to isolate merchant/category."""
-    cleaned = _FILLER_RE.sub(" ", core)
-    return re.sub(r"\s{2,}", " ", cleaned).strip()
-
-
-# ---------------------------------------------------------------------------
-# Command handlers
+# Simple command handlers (no LLM needed)
 # ---------------------------------------------------------------------------
 
 
@@ -466,133 +243,118 @@ def cmd_help() -> str:
     ])
 
 
-def cmd_total_spending(txns: list[dict] | None = None, date_label: str = "all time") -> str:
-    data = txns if txns is not None else TRANSACTIONS
-    total = sum(t["amount"] for t in data if t["amount"] < 0)
-    count = sum(1 for t in data if t["amount"] < 0)
-    if count == 0:
-        if data is not TRANSACTIONS and TRANSACTIONS:
-            latest = TRANSACTIONS[-1]["date"]
-            return f"No spending found {date_label}. My data ends {latest}."
-        return f"No spending found {date_label}."
-    return f"Total spending {date_label}: R{abs(total):,.2f}\n({count} transactions)"
-
-
-def cmd_income() -> str:
-    total = sum(t["amount"] for t in TRANSACTIONS if t["amount"] > 0)
-    count = sum(1 for t in TRANSACTIONS if t["amount"] > 0)
-    return f"Total income: R{total:,.2f}\n({count} transactions)"
-
-
 def cmd_balance() -> str:
     last = TRANSACTIONS[-1]
     return f"Closing balance: R{last['balance']:,.2f}\n(as of {last['date']})"
 
 
-def cmd_top_merchants(txns: list[dict] | None = None, date_label: str = "all time") -> str:
-    data = txns if txns is not None else TRANSACTIONS
-    spending: Counter[str] = Counter()
-    counts: Counter[str] = Counter()
-    for t in data:
-        if t["amount"] < 0:
-            merchant = extract_merchant(t["description"])
-            spending[merchant] += abs(t["amount"])
-            counts[merchant] += 1
-
-    if not spending:
-        return f"No spending found {date_label}."
-
-    lines = [f"Top 10 merchants {date_label}:\n"]
-    for i, (merchant, total) in enumerate(spending.most_common(10), 1):
-        lines.append(f"{i}. {merchant}: R{total:,.2f} ({counts[merchant]}x)")
-    return "\n".join(lines)
+# ---------------------------------------------------------------------------
+# Tool functions (called by the LLM via tool calling)
+# ---------------------------------------------------------------------------
 
 
-def cmd_month_spending(month_num: str) -> str:
-    prefix = f"2024-{month_num}"
-    month_txns = [t for t in TRANSACTIONS if t["date"].startswith(prefix)]
-
-    if not month_txns:
-        return f"No transactions found for {MONTH_NAMES[month_num]} 2024."
-
-    debits = sum(t["amount"] for t in month_txns if t["amount"] < 0)
-    credits = sum(t["amount"] for t in month_txns if t["amount"] > 0)
-    count = len(month_txns)
-
-    spending: Counter[str] = Counter()
-    for t in month_txns:
-        if t["amount"] < 0:
-            spending[extract_merchant(t["description"])] += abs(t["amount"])
-
-    lines = [
-        f"{MONTH_NAMES[month_num]} 2024 summary:",
-        f"  Spending: R{abs(debits):,.2f}",
-        f"  Income: R{credits:,.2f}",
-        f"  Transactions: {count}",
-        "",
-        "Top 5 merchants:",
-    ]
-    for i, (merchant, total) in enumerate(spending.most_common(5), 1):
-        lines.append(f"  {i}. {merchant}: R{total:,.2f}")
-    return "\n".join(lines)
+def _filter_by_dates(
+    txns: list[dict],
+    date_from: str | None,
+    date_to: str | None,
+) -> list[dict]:
+    result = txns
+    if date_from:
+        result = [t for t in result if t["date"] >= date_from]
+    if date_to:
+        result = [t for t in result if t["date"] <= date_to]
+    return result
 
 
-def cmd_merchant_search(
-    query: str,
-    txns: list[dict] | None = None,
-    date_label: str = "all time",
+def _data_coverage_hint() -> str:
+    if not TRANSACTIONS:
+        return ""
+    return f" Data covers {TRANSACTIONS[0]['date']} to {TRANSACTIONS[-1]['date']}."
+
+
+def _tool_get_balance() -> str:
+    if not TRANSACTIONS:
+        return "No transaction data available."
+    last = TRANSACTIONS[-1]
+    return f"Closing balance: R{last['balance']:,.2f} (as of {last['date']})"
+
+
+def _tool_get_total_spending(
+    date_from: str | None = None,
+    date_to: str | None = None,
 ) -> str:
-    data = txns if txns is not None else TRANSACTIONS
-    matches = []
-    for t in data:
-        merchant = extract_merchant(t["description"])
-        if query in merchant.lower() or query in t["description"].lower():
-            matches.append((t, merchant))
+    txns = _filter_by_dates(TRANSACTIONS, date_from, date_to)
+    debits = [t for t in txns if t["amount"] < 0]
+    if not debits:
+        return f"No spending found in that date range.{_data_coverage_hint()}"
+    total = sum(t["amount"] for t in debits)
+    return f"Total spending: R{abs(total):,.2f} ({len(debits)} transactions)"
 
-    if not matches:
-        if txns is not None:
-            # Date filter was active — give targeted "no results" message
-            suffix = ""
-            if not txns and TRANSACTIONS:
-                suffix = f" My data ends {TRANSACTIONS[-1]['date']}."
-            return f'No {query} spending {date_label}.{suffix}'
-        return (
-            f'No transactions found matching "{query}".\n'
-            "Try a merchant name like *uber*, *bolt*, *checkers*, or type *help*."
-        )
 
-    total = sum(abs(t["amount"]) for t, _ in matches if t["amount"] < 0)
-    count = sum(1 for t, _ in matches if t["amount"] < 0)
+def _tool_get_merchant_spending(
+    merchant: str,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> str:
+    txns = _filter_by_dates(TRANSACTIONS, date_from, date_to)
+    query = merchant.lower()
+    matches = [
+        (t, extract_merchant(t["description"]))
+        for t in txns
+        if query in extract_merchant(t["description"]).lower()
+        or query in t["description"].lower()
+    ]
+    spending_matches = [(t, m) for t, m in matches if t["amount"] < 0]
+    if not spending_matches:
+        return f"No spending found for '{merchant}'.{_data_coverage_hint()}"
+
+    total = sum(abs(t["amount"]) for t, _ in spending_matches)
+    count = len(spending_matches)
 
     by_merchant: Counter[str] = Counter()
-    for t, merchant in matches:
-        if t["amount"] < 0:
-            by_merchant[merchant] += abs(t["amount"])
+    for t, m in spending_matches:
+        by_merchant[m] += abs(t["amount"])
 
     if len(by_merchant) == 1:
-        merchant_name = list(by_merchant.keys())[0]
-        return f"Spending at {merchant_name} {date_label}: R{total:,.2f}\n({count} transactions)"
+        name = list(by_merchant.keys())[0]
+        return f"Spending at {name}: R{total:,.2f} ({count} transactions)"
 
-    lines = [f'Spending matching "{query}" {date_label}: R{total:,.2f} total\n']
-    for merchant, amt in by_merchant.most_common(10):
-        lines.append(f"  - {merchant}: R{amt:,.2f}")
-    if len(by_merchant) > 10:
-        lines.append(f"  ... and {len(by_merchant) - 10} more")
+    lines = [f"Spending matching '{merchant}': R{total:,.2f} total ({count} transactions)"]
+    for name, amt in by_merchant.most_common(10):
+        lines.append(f"  - {name}: R{amt:,.2f}")
     return "\n".join(lines)
 
 
-def _cmd_period_summary(txns: list[dict], date_label: str) -> str:
-    """Full spending summary for a date period (used when query is just a date expression)."""
+def _tool_get_top_merchants(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = 10,
+) -> str:
+    txns = _filter_by_dates(TRANSACTIONS, date_from, date_to)
+    spending: Counter[str] = Counter()
+    counts: Counter[str] = Counter()
+    for t in txns:
+        if t["amount"] < 0:
+            m = extract_merchant(t["description"])
+            spending[m] += abs(t["amount"])
+            counts[m] += 1
+
+    if not spending:
+        return f"No spending found in that date range.{_data_coverage_hint()}"
+
+    lines = [f"Top {limit} merchants:"]
+    for i, (m, total) in enumerate(spending.most_common(limit), 1):
+        lines.append(f"{i}. {m}: R{total:,.2f} ({counts[m]}x)")
+    return "\n".join(lines)
+
+
+def _tool_get_period_summary(
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> str:
+    txns = _filter_by_dates(TRANSACTIONS, date_from, date_to)
     if not txns:
-        # Hint at the actual data coverage
-        if TRANSACTIONS:
-            latest = TRANSACTIONS[-1]["date"]
-            earliest = TRANSACTIONS[0]["date"]
-            return (
-                f"No transactions found {date_label}.\n"
-                f"My data covers {earliest} to {latest}."
-            )
-        return f"No transactions found {date_label}."
+        return f"No transactions found in that date range.{_data_coverage_hint()}"
 
     debits = sum(t["amount"] for t in txns if t["amount"] < 0)
     credits = sum(t["amount"] for t in txns if t["amount"] > 0)
@@ -603,244 +365,348 @@ def _cmd_period_summary(txns: list[dict], date_label: str) -> str:
         if t["amount"] < 0:
             spending[extract_merchant(t["description"])] += abs(t["amount"])
 
+    period = f"{date_from or 'all'} to {date_to or 'all'}"
     lines = [
-        f"Summary {date_label}:",
+        f"Period summary ({period}):",
         f"  Spent: R{abs(debits):,.2f} ({debit_count} transactions)",
         f"  Income: R{credits:,.2f}",
     ]
     if spending:
-        lines.append("\nTop merchants:")
-        for i, (merchant, amt) in enumerate(spending.most_common(5), 1):
-            lines.append(f"  {i}. {merchant}: R{amt:,.2f}")
+        lines.append("Top merchants:")
+        for i, (m, amt) in enumerate(spending.most_common(5), 1):
+            lines.append(f"  {i}. {m}: R{amt:,.2f}")
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Intent Classification System
+# Tool registry (Groq / OpenAI function calling format)
 # ---------------------------------------------------------------------------
 
-from core.date_parser import parse_date_range as _parse_date_range
-from core.intent_classifier import Intent, IntentClassifier
-from core.pdf_processor import process_pdf_upload
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_balance",
+            "description": "Return the current closing account balance.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_total_spending",
+            "description": (
+                "Return total spending (debits) and transaction count for a date range. "
+                "Pass date_from and date_to as YYYY-MM-DD strings. Omit both for all-time total."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date_from": {
+                        "type": "string",
+                        "description": "Start date YYYY-MM-DD (inclusive). Omit for no lower bound.",
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "End date YYYY-MM-DD (inclusive). Omit for no upper bound.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_merchant_spending",
+            "description": (
+                "Return total spending at a specific merchant or category "
+                "(e.g. 'uber', 'woolworths', 'fuel', 'checkers'). "
+                "Searches both merchant names and raw transaction descriptions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "merchant": {
+                        "type": "string",
+                        "description": "Merchant name or keyword to search for (case-insensitive).",
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": "Start date YYYY-MM-DD (inclusive). Omit for no lower bound.",
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "End date YYYY-MM-DD (inclusive). Omit for no upper bound.",
+                    },
+                },
+                "required": ["merchant"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_top_merchants",
+            "description": "Return the top merchants ranked by total spend for a date range.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date_from": {
+                        "type": "string",
+                        "description": "Start date YYYY-MM-DD (inclusive). Omit for no lower bound.",
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "End date YYYY-MM-DD (inclusive). Omit for no upper bound.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of top merchants to return (default 10).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_period_summary",
+            "description": (
+                "Return a full spending summary for a date range: total debits, "
+                "total credits, and top 5 merchants. Use when the user asks about "
+                "a general time period without specifying a merchant."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date_from": {
+                        "type": "string",
+                        "description": "Start date YYYY-MM-DD (inclusive). Omit for no lower bound.",
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "End date YYYY-MM-DD (inclusive). Omit for no upper bound.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+]
 
-# Wire up Groq fast model for LLM-based intent classification fallback
-IntentClassifier.setup_llm(groq_client, GROQ_MODEL_FAST)
+
+def _execute_tool(name: str, args: dict) -> str:
+    """Dispatch a tool call by name and return the string result."""
+    if name == "get_balance":
+        return _tool_get_balance()
+    elif name == "get_total_spending":
+        return _tool_get_total_spending(
+            date_from=args.get("date_from"),
+            date_to=args.get("date_to"),
+        )
+    elif name == "get_merchant_spending":
+        return _tool_get_merchant_spending(
+            merchant=args["merchant"],
+            date_from=args.get("date_from"),
+            date_to=args.get("date_to"),
+        )
+    elif name == "get_top_merchants":
+        return _tool_get_top_merchants(
+            date_from=args.get("date_from"),
+            date_to=args.get("date_to"),
+            limit=int(args.get("limit", 10)),
+        )
+    elif name == "get_period_summary":
+        return _tool_get_period_summary(
+            date_from=args.get("date_from"),
+            date_to=args.get("date_to"),
+        )
+    else:
+        return f"Unknown tool: {name}"
+
+
+# ---------------------------------------------------------------------------
+# LLM with tool calling
+# ---------------------------------------------------------------------------
+
+
+def ask_llm_with_tools(
+    message: str,
+    history: list[dict] | None = None,
+) -> dict:
+    """
+    Send a message to Groq with tool calling enabled.
+
+    The LLM chooses which tool(s) to call. Results are fed back for a
+    natural-language response. Falls back to direct answer when no tools needed.
+
+    Returns:
+        dict with content, llm_time, tokens, used_llm, error
+    """
+    start = time.monotonic()
+
+    if not groq_client or not GROQ_API_KEY:
+        elapsed = time.monotonic() - start
+        return {
+            "content": "LLM is not configured. Type *balance* or *help*.",
+            "llm_time": round(elapsed, 3),
+            "tokens": 0,
+            "used_llm": True,
+            "error": True,
+        }
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    data_start = TRANSACTIONS[0]["date"] if TRANSACTIONS else "N/A"
+    data_end = TRANSACTIONS[-1]["date"] if TRANSACTIONS else "N/A"
+
+    system_msg = (
+        f"{SPENDING_SUMMARY}\n\n"
+        f"Today is {today}. My transaction data covers {data_start} to {data_end}.\n"
+        "You have tools to query precise spending data. When the user mentions a time period, "
+        "resolve it to exact YYYY-MM-DD dates before calling tools. "
+        "Keep responses concise — this is WhatsApp, under 80 words. "
+        "Use conversation history to resolve pronouns and follow-ups."
+    )
+
+    messages: list[dict] = [{"role": "system", "content": system_msg}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": message})
+
+    print(
+        f"[LLM] message='{message[:60]}' history={len(history or [])} turns",
+        file=sys.stderr,
+    )
+
+    try:
+        # First call — LLM decides whether and which tools to use
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL_MAIN,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=500,
+        )
+
+        assistant_msg = response.choices[0].message
+        tokens = response.usage.total_tokens if response.usage else 0
+
+        # No tool calls — return direct response (conversational / general advice)
+        if not assistant_msg.tool_calls:
+            elapsed = time.monotonic() - start
+            content = assistant_msg.content.strip() if assistant_msg.content else ""
+            print(f"[LLM] Direct response ({len(content)} chars)", file=sys.stderr)
+            return {
+                "content": content,
+                "llm_time": round(elapsed, 3),
+                "tokens": tokens,
+                "used_llm": True,
+                "error": False,
+            }
+
+        # Execute each tool call
+        messages.append(assistant_msg)
+
+        for tool_call in assistant_msg.tool_calls:
+            tool_name = tool_call.function.name
+            tool_args = json.loads(tool_call.function.arguments)
+            print(f"[TOOL] {tool_name}({tool_args})", file=sys.stderr)
+
+            tool_result = _execute_tool(tool_name, tool_args)
+            print(f"[TOOL] Result: {tool_result[:120]}", file=sys.stderr)
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": tool_result,
+            })
+
+        # Second call — format tool results as a natural language response
+        final_response = groq_client.chat.completions.create(
+            model=GROQ_MODEL_MAIN,
+            messages=messages,
+            max_tokens=300,
+        )
+
+        elapsed = time.monotonic() - start
+        content = final_response.choices[0].message.content.strip()
+        tokens += final_response.usage.total_tokens if final_response.usage else 0
+
+        print(f"[LLM] Tool-call response ({len(content)} chars, {tokens} tokens)", file=sys.stderr)
+
+        return {
+            "content": content,
+            "llm_time": round(elapsed, 3),
+            "tokens": tokens,
+            "used_llm": True,
+            "error": False,
+        }
+
+    except Exception as e:
+        elapsed = time.monotonic() - start
+        print(f"[LLM ERROR] {type(e).__name__}: {e}", file=sys.stderr)
+
+        error_msg = str(e)
+        if "quota" in error_msg.lower() or "rate" in error_msg.lower():
+            user_msg = "Rate limit exceeded. Please try again in a moment."
+        elif "invalid" in error_msg.lower() and "key" in error_msg.lower():
+            user_msg = "API key is invalid. Please check your configuration."
+        else:
+            user_msg = "Sorry, I couldn't process that right now."
+
+        return {
+            "content": f"{user_msg} Type *help* for commands.",
+            "llm_time": round(elapsed, 3),
+            "tokens": 0,
+            "used_llm": True,
+            "error": True,
+        }
 
 
 # ---------------------------------------------------------------------------
 # Message router
 # ---------------------------------------------------------------------------
 
-
-def _keyword_result(content: str) -> dict:
-    return {"content": content, "used_llm": False, "intent": None, "confidence": 1.0}
-
-
-# Intent-specific handler functions
-def handle_greeting(message: str, confidence: float, history: list[dict] | None = None) -> dict:
-    """Handle greeting intents."""
-    return _keyword_result(cmd_help())
-
-
-def handle_account_balance(message: str, confidence: float, history: list[dict] | None = None) -> dict:
-    """Handle balance check requests."""
-    text = message.strip().lower()
-    if text in ("balance", "closing balance", "current balance"):
-        return _keyword_result(cmd_balance())
-    max_words = IntentClassifier.get_max_words(Intent.ACCOUNT_BALANCE)
-    result = ask_llm(message, max_words=max_words, history=history)
-    result["used_llm"] = True
-    return result
-
-
-def handle_spending_query(message: str, confidence: float, history: list[dict] | None = None) -> dict:
-    """Handle spending-related queries, with optional date filtering."""
-    text = message.strip().lower()
-    # Strip leading "and"/"and then" — context continuation from prior message
-    text = re.sub(r"^\s*and\s+(then\s+)?", "", text).strip()
-    today = datetime.now()
-
-    # --- 1. Parse date range from the message ---
-    date_range = _parse_date_range(text)
-    filtered_txns: list[dict] | None = None
-    date_label = "all time"
-    start = end = None
-
-    if date_range:
-        start, end = date_range
-        if start.date() > today.date():
-            return _keyword_result("That date is in the future! Try asking about past spending.")
-        # Cap end at today
-        if end.date() > today.date():
-            end = today
-        filtered_txns = _filter_transactions(TRANSACTIONS, start, end)
-        date_label = _date_label(start, end)
-        print(f"[SPENDING] Date range: {start.date()} → {end.date()} ({date_label})", file=sys.stderr)
-    else:
-        print(f"[SPENDING] No date range found, using all time. text='{text}'", file=sys.stderr)
-
-    txns = filtered_txns if filtered_txns is not None else TRANSACTIONS
-
-    # --- 2. Strip date tokens to isolate the core query ---
-    core = _strip_date_tokens(text)
-    # Also remove any leftover punctuation that isn't part of a merchant name
-    core = re.sub(r"[^\w\s]", "", core).strip()
-    print(f"[SPENDING] core='{core}'", file=sys.stderr)
-
-    # --- 3. Exact keyword matches on core query ---
-    if core in ("total spending", "total spend", "total debits", "total", "spending", "spend", ""):
-        if not core or core in ("spending", "spend"):
-            # Bare date expression (e.g. "march", "last month") → period summary
-            return _keyword_result(_cmd_period_summary(txns, date_label))
-        return _keyword_result(cmd_total_spending(txns, date_label))
-
-    if core in ("top merchants", "top spend", "top", "biggest", "top 10"):
-        return _keyword_result(cmd_top_merchants(txns, date_label))
-
-    # --- 4. Merchant/category search ---
-    # Strip filler question words ("how much uber" → "uber")
-    merchant_query = _extract_merchant_query(core)
-    # Drop any remaining punctuation-only content
-    merchant_query = re.sub(r"[^\w\s]", "", merchant_query).strip()
-    words = merchant_query.split()
-    print(f"[SPENDING] merchant_query='{merchant_query}'", file=sys.stderr)
-
-    # If no specific merchant/category remains after stripping, treat as period summary
-    if not merchant_query:
-        return _keyword_result(_cmd_period_summary(txns, date_label))
-
-    if merchant_query and len(words) <= 3:
-        merchant_result = cmd_merchant_search(merchant_query, txns, date_label)
-        # Return if date was specified (even "no results") or a match was found
-        if filtered_txns is not None or not merchant_result.startswith("No transactions found"):
-            return {
-                "content": merchant_result,
-                "used_llm": False,
-                "intent": "spending_query",
-                "confidence": confidence,
-            }
-
-    # --- 5. LLM fallback for complex queries ---
-    llm_message = message
-    if date_range:
-        llm_message += f"\n[Date filter: {date_label} ({start.date()} to {end.date()})]"
-    max_words = IntentClassifier.get_max_words(Intent.SPENDING_QUERY)
-    result = ask_llm(llm_message, max_words=max_words, history=history)
-    result["used_llm"] = True
-    return result
-
-
-def handle_debt_advice(message: str, confidence: float, history: list[dict] | None = None) -> dict:
-    """Handle debt and credit-related advice."""
-    max_words = IntentClassifier.get_max_words(Intent.DEBT_ADVICE)
-    result = ask_llm(message, max_words=max_words, history=history)
-    result["used_llm"] = True
-    return result
-
-
-def handle_budget_check(message: str, confidence: float, history: list[dict] | None = None) -> dict:
-    """Handle budget and affordability checks."""
-    max_words = IntentClassifier.get_max_words(Intent.BUDGET_CHECK)
-    result = ask_llm(message, max_words=max_words, history=history)
-    result["used_llm"] = True
-    return result
-
-
-def handle_document_upload(message: str, confidence: float, history: list[dict] | None = None) -> dict:
-    """Handle document upload requests."""
-    return {
-        "content": "📄 Document upload coming soon! Contact support for manual uploads.",
-        "used_llm": False,
-        "intent": "document_upload",
-        "confidence": confidence,
-    }
-
-
-def handle_general_financial_advice(message: str, confidence: float, history: list[dict] | None = None) -> dict:
-    """Handle general financial advice requests."""
-    max_words = IntentClassifier.get_max_words(Intent.GENERAL_FINANCIAL_ADVICE)
-    result = ask_llm(message, max_words=max_words, history=history)
-    result["used_llm"] = True
-    return result
-
-
-def handle_unknown(message: str, confidence: float, history: list[dict] | None = None) -> dict:
-    """Handle unknown intents - fallback to LLM or help."""
-    if len(message.strip()) < 5:
-        return _keyword_result(cmd_help())
-    max_words = IntentClassifier.DEFAULT_MAX_WORDS
-    result = ask_llm(message, max_words=max_words, history=history)
-    result["used_llm"] = True
-    return result
-
-
-# Intent router mapping
-INTENT_HANDLERS = {
-    Intent.GREETING: handle_greeting,
-    Intent.ACCOUNT_BALANCE: handle_account_balance,
-    Intent.SPENDING_QUERY: handle_spending_query,
-    Intent.DEBT_ADVICE: handle_debt_advice,
-    Intent.BUDGET_CHECK: handle_budget_check,
-    Intent.DOCUMENT_UPLOAD: handle_document_upload,
-    Intent.GENERAL_FINANCIAL_ADVICE: handle_general_financial_advice,
-    Intent.UNKNOWN: handle_unknown,
-}
+GREETING_WORDS = {"hi", "hello", "hey", "help", "helo", "howzit", "sup", "yo", "hiya"}
+BALANCE_WORDS = {"balance", "closing balance", "current balance", "my balance"}
 
 
 def handle_message(body: str, history: list[dict] | None = None) -> dict:
     """
-    Route an incoming message using intent classification.
+    Route an incoming message.
 
-    Args:
-        body:    Raw message text from the user
-        history: Recent conversation turns from chat_history (oldest first)
-
-    Returns a result dict with: content, used_llm, intent, confidence
+    Fast-path for greetings and balance checks; everything else goes to
+    the LLM with tool calling so it can query spending data directly.
     """
     text = body.strip()
+    lower = text.lower().strip("?!. ")
 
-    # Classify intent
-    intent, confidence, reasoning = IntentClassifier.classify(text)
-
-    print(
-        f"[INTENT] Detected: {intent.value} | Confidence: {confidence:.2f} | Reason: {reasoning}",
-        file=sys.stderr
-    )
-
-    # Handle low confidence - ask for clarification
-    if confidence < IntentClassifier.CONFIDENCE_THRESHOLD_LOW:
-        print(f"[INTENT] Low confidence ({confidence:.2f}), asking for clarification", file=sys.stderr)
+    # Fast path: greetings (or very short ambiguous inputs)
+    if lower in GREETING_WORDS or (len(text) <= 3 and not text.isdigit()):
         return {
-            "content": "Not sure what you meant. Try: *total*, *balance*, *top*, *march*, *uber*, or *help*",
+            "content": cmd_help(),
             "used_llm": False,
-            "intent": intent.value,
-            "confidence": confidence,
+            "intent": "greeting",
+            "confidence": 1.0,
+            "tokens": 0,
         }
 
-    # If classified as greeting but there's prior history and the message isn't
-    # an actual greeting word, treat it as a contextual follow-up instead so the
-    # LLM can answer using conversation context (e.g. "really?", "wow", "seriously")
-    REAL_GREETINGS = {"hi", "hello", "hey", "help", "helo", "howzit", "sup", "yo"}
-    if (
-        intent == Intent.GREETING
-        and history
-        and text.lower().strip("?!.") not in REAL_GREETINGS
-    ):
-        intent = Intent.GENERAL_FINANCIAL_ADVICE
-        print("[INTENT] Rerouted greeting→general (follow-up detected)", file=sys.stderr)
+    # Fast path: balance checks
+    if lower in BALANCE_WORDS:
+        return {
+            "content": cmd_balance(),
+            "used_llm": False,
+            "intent": "account_balance",
+            "confidence": 1.0,
+            "tokens": 0,
+        }
 
-    # Route to appropriate handler, passing history for LLM context
-    handler = INTENT_HANDLERS.get(intent, handle_unknown)
-    result = handler(text, confidence, history=history or [])
-
-    # Add intent metadata to result
-    result["intent"] = intent.value
-    result["confidence"] = confidence
-
-    # Enforce word limit on response
-    max_words = IntentClassifier.get_max_words(intent)
-    result["content"] = IntentClassifier.truncate_response(result["content"], max_words)
-
+    # Tool calling for all spending queries and general questions
+    result = ask_llm_with_tools(text, history=history)
+    result["intent"] = "tool_call"
+    result["confidence"] = 1.0
     return result
 
 
@@ -849,6 +715,8 @@ def handle_message(body: str, history: list[dict] | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
+
+from core.pdf_processor import process_pdf_upload
 
 
 # ---------------------------------------------------------------------------
@@ -874,7 +742,7 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Metrics database (now using Supabase)
+# Metrics database (Supabase)
 # ---------------------------------------------------------------------------
 
 
@@ -893,9 +761,8 @@ def _log_metric(
     intent: str | None = None,
     confidence: float | None = None,
 ) -> None:
-    """Log interaction metrics to Supabase with intent classification data."""
+    """Log interaction metrics to Supabase."""
     try:
-        # Get or create user
         user_response = (
             supabase.table("users")
             .select("id, total_messages")
@@ -906,7 +773,6 @@ def _log_metric(
         if user_response.data:
             user_id = user_response.data[0]["id"]
             current_total = user_response.data[0]["total_messages"]
-            # Update last_seen and increment message count
             supabase.table("users").update(
                 {
                     "last_seen_at": datetime.now(timezone.utc).isoformat(),
@@ -914,7 +780,6 @@ def _log_metric(
                 }
             ).eq("id", user_id).execute()
         else:
-            # Create new user
             user_response = (
                 supabase.table("users")
                 .insert({"phone_hash": user_hash, "total_messages": 1})
@@ -922,8 +787,7 @@ def _log_metric(
             )
             user_id = user_response.data[0]["id"]
 
-        # Insert metric
-        metric_data = {
+        metric_data: dict = {
             "user_id": user_id,
             "message_text": message_text,
             "used_llm": used_llm,
@@ -932,8 +796,6 @@ def _log_metric(
             "success": success,
             "tokens_used": tokens,
         }
-
-        # Add intent classification data if available
         if intent:
             metric_data["intent"] = intent
         if confidence is not None:
@@ -942,13 +804,13 @@ def _log_metric(
         supabase.table("metrics").insert(metric_data).execute()
 
     except Exception as e:
-        # Log error but don't fail the webhook response
         print(f"Error logging metric: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
 # Chat history (conversational memory)
 # ---------------------------------------------------------------------------
+
 
 def _get_user_id(user_hash: str) -> str | None:
     """Return Supabase user_id for a phone hash, or None if not found."""
@@ -978,9 +840,9 @@ def _load_chat_history(user_hash: str, limit: int = 5) -> list[dict]:
             .execute()
         ).data
         messages: list[dict] = []
-        for row in reversed(rows):          # oldest first
-            messages.append({"role": "user",      "content": row["user_message"]})
-            messages.append({"role": "assistant",  "content": row["bot_response"]})
+        for row in reversed(rows):
+            messages.append({"role": "user", "content": row["user_message"]})
+            messages.append({"role": "assistant", "content": row["bot_response"]})
         return messages
     except Exception as e:
         print(f"[HISTORY] Load failed (non-fatal): {e}", file=sys.stderr)
@@ -1040,12 +902,6 @@ def webhook():
             media_type = request.form.get("MediaContentType0", "")
             print(f"[WEBHOOK] Media received from {user_hash[:8]}: {media_type}", file=sys.stderr)
 
-            # Send immediate acknowledgement
-            ack = MessagingResponse()
-            ack.message("⏳ Processing your statement, please wait...")
-            # Note: we still process synchronously; ack is sent as the response
-            # For true async we'd need a background worker - this is good enough for now
-
             pdf_result = process_pdf_upload(
                 supabase=supabase,
                 media_url=media_url,
@@ -1075,7 +931,7 @@ def webhook():
 
         # --- Text message path ---
         incoming_msg = request.form.get("Body", "").strip()
-        print(f"[WEBHOOK] Received message from {user_hash[:8]}: '{incoming_msg[:50]}'", file=sys.stderr)
+        print(f"[WEBHOOK] Received from {user_hash[:8]}: '{incoming_msg[:80]}'", file=sys.stderr)
 
         # Handle "clear history" before anything else
         if incoming_msg.lower() in ("clear history", "start fresh", "forget everything"):
@@ -1090,7 +946,6 @@ def webhook():
         result = handle_message(incoming_msg, history=history)
         total_time = time.monotonic() - start
 
-        # Save this exchange to chat history (best-effort)
         _save_chat_message(
             user_hash,
             incoming_msg,
@@ -1112,7 +967,7 @@ def webhook():
 
         resp = MessagingResponse()
         resp.message(result["content"])
-        print(f"[WEBHOOK] Sending response: '{result['content'][:120]}'", file=sys.stderr)
+        print(f"[WEBHOOK] Sending: '{result['content'][:120]}'", file=sys.stderr)
         return str(resp), 200, {"Content-Type": "application/xml"}
 
     except Exception as e:
@@ -1143,7 +998,6 @@ def upload_statement():
         return {"error": "Invalid file or user_hash"}, 400
 
     try:
-        # Validate user exists
         user_response = (
             supabase.table("users").select("id").eq("phone_hash", user_hash).single().execute()
         )
@@ -1151,7 +1005,6 @@ def upload_statement():
         if not user_response.data:
             return {"error": "User not found"}, 404
 
-        # Upload to Supabase Storage
         storage_path = f"{user_hash}/{file.filename}"
         file_bytes = file.read()
 
@@ -1242,7 +1095,6 @@ def dashboard():
     week_ago = (now - timedelta(days=7)).isoformat()
 
     try:
-        # Counts - today's messages
         today_response = (
             supabase.table("metrics")
             .select("*", count="exact")
@@ -1251,7 +1103,6 @@ def dashboard():
         )
         today = today_response.count
 
-        # Count - this week
         week_response = (
             supabase.table("metrics")
             .select("*", count="exact")
@@ -1260,11 +1111,9 @@ def dashboard():
         )
         week = week_response.count
 
-        # Count - total
         total_response = supabase.table("metrics").select("*", count="exact").execute()
         total = total_response.count
 
-        # Averages - fetch all metrics with LLM for client-side aggregation
         metrics_with_llm = (
             supabase.table("metrics")
             .select("llm_response_time")
@@ -1275,37 +1124,29 @@ def dashboard():
 
         if metrics_with_llm.data:
             llm_times = [m["llm_response_time"] for m in metrics_with_llm.data]
-            avg_llm_value = sum(llm_times) / len(llm_times)
-            avg_llm = f"{avg_llm_value:.2f}"
+            avg_llm = f"{sum(llm_times) / len(llm_times):.2f}"
         else:
             avg_llm = "-"
 
-        # Average total response time
         all_metrics = supabase.table("metrics").select("total_response_time").execute()
-
         if all_metrics.data:
             total_times = [m["total_response_time"] for m in all_metrics.data]
-            avg_total_value = sum(total_times) / len(total_times)
-            avg_total = f"{avg_total_value:.2f}"
+            avg_total = f"{sum(total_times) / len(total_times):.2f}"
         else:
             avg_total = "-"
 
-        # Error rate
         errors_response = (
             supabase.table("metrics").select("*", count="exact").eq("success", False).execute()
         )
         errors = errors_response.count
         error_rate = f"{errors / total * 100:.1f}%" if total > 0 else "0%"
 
-        # Users - fetch all metrics and group client-side
         all_metrics_for_users = supabase.table("metrics").select("user_id, used_llm").execute()
-
         user_stats = defaultdict(lambda: {"cnt": 0, "llm_cnt": 0})
         for m in all_metrics_for_users.data:
             user_stats[m["user_id"]]["cnt"] += 1
             user_stats[m["user_id"]]["llm_cnt"] += 1 if m["used_llm"] else 0
 
-        # Get user phone_hashes for top 20 users
         sorted_users = sorted(
             user_stats.keys(), key=lambda uid: user_stats[uid]["cnt"], reverse=True
         )
@@ -1315,11 +1156,7 @@ def dashboard():
             users_data = (
                 supabase.table("users").select("id, phone_hash").in_("id", top_user_ids).execute()
             )
-
-            # Create lookup dict
             user_hash_map = {u["id"]: u["phone_hash"] for u in users_data.data}
-
-            # Format for template
             users = [
                 {
                     "user_hash": user_hash_map.get(uid, "unknown"),
@@ -1337,10 +1174,8 @@ def dashboard():
             for u in users
         )
 
-        # Patterns - fetch all message texts and group client-side
         all_messages = supabase.table("metrics").select("message_text").execute()
-
-        pattern_counter = defaultdict(int)
+        pattern_counter: defaultdict[str, int] = defaultdict(int)
         for m in all_messages.data:
             pattern_counter[m["message_text"].lower()] += 1
 
@@ -1349,15 +1184,12 @@ def dashboard():
             f"<tr><td>{escape(msg)}</td><td>{cnt}</td></tr>" for msg, cnt in patterns
         )
 
-        # Time series - fetch metrics from last 7 days and group by day
         week_metrics = (
             supabase.table("metrics").select("timestamp").gte("timestamp", week_ago).execute()
         )
-
-        day_counter = defaultdict(int)
+        day_counter: defaultdict[str, int] = defaultdict(int)
         for m in week_metrics.data:
-            day = m["timestamp"][:10]  # Extract YYYY-MM-DD
-            day_counter[day] += 1
+            day_counter[m["timestamp"][:10]] += 1
 
         days = sorted(day_counter.items())
         max_cnt = max((cnt for _, cnt in days), default=1)
@@ -1396,7 +1228,6 @@ def dashboard():
 # Startup Logging
 # ---------------------------------------------------------------------------
 
-# Log all registered routes for debugging
 print("\n" + "=" * 60, file=sys.stderr)
 print("[STARTUP] Flask app initialized successfully!", file=sys.stderr)
 print("[STARTUP] Registered routes:", file=sys.stderr)
