@@ -5,12 +5,10 @@ Handles downloading, parsing, deduplication, and Supabase storage
 of FNB bank statement PDFs sent via WhatsApp/Twilio.
 """
 
-import os
 import re
-import subprocess
 import sys
-import tempfile
 from datetime import datetime, timezone
+from io import BytesIO
 
 import requests
 
@@ -27,28 +25,55 @@ MONTH_MAP = {
 
 
 def extract_text_from_bytes(pdf_bytes: bytes) -> str:
-    """Extract text from PDF bytes using pdftotext."""
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
+    """
+    Extract text from PDF bytes preserving column layout.
+
+    Uses pdfminer with position-aware reconstruction so that amounts
+    appear on the same line as their descriptions (like pdftotext -layout).
+    Pure Python — no system dependencies required.
+    """
+    from pdfminer.high_level import extract_pages
+    from pdfminer.layout import LAParams, LTTextBox, LTTextLine
 
     try:
-        result = subprocess.run(
-            ["pdftotext", "-layout", tmp_path, "-"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=30,
-        )
-        return result.stdout
-    except subprocess.CalledProcessError:
-        raise ValueError("Could not read this PDF. Please make sure it's a valid FNB bank statement.")
-    except subprocess.TimeoutExpired:
-        raise ValueError("PDF took too long to process. Try a smaller file.")
-    except FileNotFoundError:
-        raise RuntimeError("pdftotext not installed on server.")
-    finally:
-        os.unlink(tmp_path)
+        params = LAParams(line_margin=0.5, word_margin=0.1, char_margin=2.0)
+        all_lines = []
+
+        for page in extract_pages(BytesIO(pdf_bytes), laparams=params):
+            h = page.height
+            elements = []
+            for elem in page:
+                if isinstance(elem, LTTextBox):
+                    for line in elem:
+                        if isinstance(line, LTTextLine):
+                            text = line.get_text().strip()
+                            if text:
+                                elements.append((round(h - line.y0), round(line.x0), text))
+
+            # Sort top-to-bottom, then left-to-right
+            elements.sort(key=lambda e: (e[0], e[1]))
+            if not elements:
+                continue
+
+            # Group elements within 4px vertically into the same row
+            rows, current_y, current_row = [], elements[0][0], []
+            for y, x, text in elements:
+                if abs(y - current_y) <= 4:
+                    current_row.append((x, text))
+                else:
+                    rows.append(sorted(current_row, key=lambda e: e[0]))
+                    current_row = [(x, text)]
+                    current_y = y
+            if current_row:
+                rows.append(sorted(current_row, key=lambda e: e[0]))
+
+            for row in rows:
+                all_lines.append("  ".join(t for _, t in row))
+
+        return "\n".join(all_lines)
+
+    except Exception as e:
+        raise ValueError(f"Could not read this PDF. Please make sure it's a valid FNB bank statement. ({e})")
 
 
 def is_fnb_statement(text: str) -> bool:
