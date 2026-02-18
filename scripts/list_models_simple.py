@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """List available Gemini models - simplified version."""
 
-# Replace with your actual API key
-GEMINI_API_KEY = "AIzaSyC_7UfsUaCMpRif7LehctaRdN7ef668Icg"
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 try:
     from google import genai
