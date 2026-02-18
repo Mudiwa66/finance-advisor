@@ -448,7 +448,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_top_merchants",
-            "description": "Return the top merchants ranked by total spend for a date range.",
+            "description": "Return the top 10 merchants ranked by total spend for a date range.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -459,10 +459,6 @@ TOOLS = [
                     "date_to": {
                         "type": "string",
                         "description": "End date YYYY-MM-DD (inclusive). Omit for no upper bound.",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Number of top merchants to return (default 10).",
                     },
                 },
                 "required": [],
