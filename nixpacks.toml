@@ -1,5 +1,5 @@
 [phases.setup]
-aptPkgs = ["poppler-utils"]  # provides pdftotext
+nixPkgs = ["poppler_utils"]
 
 [start]
 cmd = "gunicorn app:app --bind 0.0.0.0:$PORT"
