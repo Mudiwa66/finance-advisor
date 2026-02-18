@@ -383,7 +383,7 @@ _DATE_TOKEN_RE = re.compile(
     r"\b(in|on|for|during|last|this|past|the|next|"
     r"january|jan|february|feb|march|mar|april|apr|june|jun|"
     r"july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec|"
-    r"weeks?|months?|years?|quarter|yesterday|today|ago|before|"
+    r"weeks?|months?|years?|quarter|yesterday|today|ago|before|of|"
     r"q[1-4]|first|second|third|fourth)\b"
     r"|\b20\d{2}\b"
     r"|\b\d+\s+days?\b"
@@ -1112,7 +1112,7 @@ def webhook():
 
         resp = MessagingResponse()
         resp.message(result["content"])
-        print(f"[WEBHOOK] Sending response: '{result['content'][:50]}'", file=sys.stderr)
+        print(f"[WEBHOOK] Sending response: '{result['content'][:120]}'", file=sys.stderr)
         return str(resp), 200, {"Content-Type": "application/xml"}
 
     except Exception as e:
