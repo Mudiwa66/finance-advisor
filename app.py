@@ -3,6 +3,7 @@
 
 import hashlib
 import os
+import random
 import re
 import sys
 import time
@@ -366,10 +367,12 @@ MONTH_NAMES = {
 
 
 def cmd_help() -> str:
-    return (
-        "👋 Hi! I'm your FNB spending assistant.\n\n"
-        "Ask me naturally, or try: *total*, *balance*, *top*, *march*, *uber*"
-    )
+    return random.choice([
+        "Hi! How can I help?",
+        "Hey! What would you like to know?",
+        "Hi there! Ask me anything about your spending.",
+        "Hello! What can I look up for you?",
+    ])
 
 
 def cmd_total_spending() -> str:
