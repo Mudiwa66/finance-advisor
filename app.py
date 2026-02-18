@@ -169,23 +169,27 @@ def build_spending_summary() -> str:
     )
 
 
-def ask_llm(question: str, max_words: int = 50) -> dict:
+def ask_llm(
+    question: str,
+    max_words: int = 50,
+    history: list[dict] | None = None,
+) -> dict:
     """
-    Send a question to Groq with word limit enforcement.
+    Send a question to Groq with conversation history and word limit.
 
     Args:
-        question: User's question
-        max_words: Maximum words allowed in response (default: 50)
+        question:  Current user message
+        max_words: Maximum words in response
+        history:   List of {role, content} dicts from chat_history (oldest first)
 
     Returns:
         dict with content, timing, tokens
     """
     start = time.monotonic()
 
-    print(f"[LLM] Called with question: '{question[:50]}...' (max_words: {max_words})", file=sys.stderr)
+    print(f"[LLM] question='{question[:50]}' max_words={max_words} history={len(history or [])} turns", file=sys.stderr)
 
     if not groq_client or not GROQ_API_KEY:
-        # Fallback if no API token
         print("[LLM ERROR] GROQ_API_KEY not set!", file=sys.stderr)
         elapsed = time.monotonic() - start
         return {
@@ -199,18 +203,27 @@ def ask_llm(question: str, max_words: int = 50) -> dict:
         }
 
     try:
-        # Build prompt with context and word limit instruction
-        prompt = (
+        # System message: financial context + word limit instruction
+        system_msg = (
             f"{SPENDING_SUMMARY}\n\n"
-            f"User question: {question}\n\n"
-            f"IMPORTANT: Keep your response under {max_words} words. "
-            f"This is WhatsApp - be concise and text-like, not essay-like."
+            f"Keep responses under {max_words} words. "
+            "This is WhatsApp — be concise. "
+            "Use conversation history to resolve pronouns and follow-ups "
+            "('it', 'that', 'which one', 'what about last month')."
         )
+
+        messages = [{"role": "system", "content": system_msg}]
+
+        # Inject conversation history so the LLM has context
+        if history:
+            messages.extend(history)
+
+        messages.append({"role": "user", "content": question})
 
         # Call Groq API
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL_MAIN,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             max_tokens=max_words * 2,
         )
 
@@ -608,25 +621,23 @@ def _keyword_result(content: str) -> dict:
 
 
 # Intent-specific handler functions
-def handle_greeting(message: str, confidence: float) -> dict:
+def handle_greeting(message: str, confidence: float, history: list[dict] | None = None) -> dict:
     """Handle greeting intents."""
     return _keyword_result(cmd_help())
 
 
-def handle_account_balance(message: str, confidence: float) -> dict:
+def handle_account_balance(message: str, confidence: float, history: list[dict] | None = None) -> dict:
     """Handle balance check requests."""
-    # Check if it's a simple balance query
     text = message.strip().lower()
     if text in ("balance", "closing balance", "current balance"):
         return _keyword_result(cmd_balance())
-    # Otherwise use LLM for nuanced balance questions
     max_words = IntentClassifier.get_max_words(Intent.ACCOUNT_BALANCE)
-    result = ask_llm(message, max_words=max_words)
+    result = ask_llm(message, max_words=max_words, history=history)
     result["used_llm"] = True
     return result
 
 
-def handle_spending_query(message: str, confidence: float) -> dict:
+def handle_spending_query(message: str, confidence: float, history: list[dict] | None = None) -> dict:
     """Handle spending-related queries, with optional date filtering."""
     text = message.strip().lower()
     today = datetime.now()
@@ -682,57 +693,51 @@ def handle_spending_query(message: str, confidence: float) -> dict:
     if date_range:
         llm_message += f"\n[Date filter: {date_label} ({start.date()} to {end.date()})]"
     max_words = IntentClassifier.get_max_words(Intent.SPENDING_QUERY)
-    result = ask_llm(llm_message, max_words=max_words)
+    result = ask_llm(llm_message, max_words=max_words, history=history)
     result["used_llm"] = True
     return result
 
 
-def handle_debt_advice(message: str, confidence: float) -> dict:
+def handle_debt_advice(message: str, confidence: float, history: list[dict] | None = None) -> dict:
     """Handle debt and credit-related advice."""
-    # Use LLM with financial context
     max_words = IntentClassifier.get_max_words(Intent.DEBT_ADVICE)
-    result = ask_llm(message, max_words=max_words)
+    result = ask_llm(message, max_words=max_words, history=history)
     result["used_llm"] = True
     return result
 
 
-def handle_budget_check(message: str, confidence: float) -> dict:
+def handle_budget_check(message: str, confidence: float, history: list[dict] | None = None) -> dict:
     """Handle budget and affordability checks."""
-    # Use LLM for budget analysis
     max_words = IntentClassifier.get_max_words(Intent.BUDGET_CHECK)
-    result = ask_llm(message, max_words=max_words)
+    result = ask_llm(message, max_words=max_words, history=history)
     result["used_llm"] = True
     return result
 
 
-def handle_document_upload(message: str, confidence: float) -> dict:
+def handle_document_upload(message: str, confidence: float, history: list[dict] | None = None) -> dict:
     """Handle document upload requests."""
     return {
         "content": "📄 Document upload coming soon! Contact support for manual uploads.",
         "used_llm": False,
         "intent": "document_upload",
-        "confidence": confidence
+        "confidence": confidence,
     }
 
 
-def handle_general_financial_advice(message: str, confidence: float) -> dict:
+def handle_general_financial_advice(message: str, confidence: float, history: list[dict] | None = None) -> dict:
     """Handle general financial advice requests."""
-    # Use LLM for financial advice
     max_words = IntentClassifier.get_max_words(Intent.GENERAL_FINANCIAL_ADVICE)
-    result = ask_llm(message, max_words=max_words)
+    result = ask_llm(message, max_words=max_words, history=history)
     result["used_llm"] = True
     return result
 
 
-def handle_unknown(message: str, confidence: float) -> dict:
+def handle_unknown(message: str, confidence: float, history: list[dict] | None = None) -> dict:
     """Handle unknown intents - fallback to LLM or help."""
-    # If message is very short, suggest help
     if len(message.strip()) < 5:
         return _keyword_result(cmd_help())
-
-    # Otherwise try LLM with default limit
     max_words = IntentClassifier.DEFAULT_MAX_WORDS
-    result = ask_llm(message, max_words=max_words)
+    result = ask_llm(message, max_words=max_words, history=history)
     result["used_llm"] = True
     return result
 
@@ -750,9 +755,13 @@ INTENT_HANDLERS = {
 }
 
 
-def handle_message(body: str) -> dict:
+def handle_message(body: str, history: list[dict] | None = None) -> dict:
     """
     Route an incoming message using intent classification.
+
+    Args:
+        body:    Raw message text from the user
+        history: Recent conversation turns from chat_history (oldest first)
 
     Returns a result dict with: content, used_llm, intent, confidence
     """
@@ -776,9 +785,9 @@ def handle_message(body: str) -> dict:
             "confidence": confidence,
         }
 
-    # Route to appropriate handler
+    # Route to appropriate handler, passing history for LLM context
     handler = INTENT_HANDLERS.get(intent, handle_unknown)
-    result = handler(text, confidence)
+    result = handler(text, confidence, history=history or [])
 
     # Add intent metadata to result
     result["intent"] = intent.value
@@ -894,6 +903,79 @@ def _log_metric(
 
 
 # ---------------------------------------------------------------------------
+# Chat history (conversational memory)
+# ---------------------------------------------------------------------------
+
+def _get_user_id(user_hash: str) -> str | None:
+    """Return Supabase user_id for a phone hash, or None if not found."""
+    try:
+        r = supabase.table("users").select("id").eq("phone_hash", user_hash).execute()
+        return r.data[0]["id"] if r.data else None
+    except Exception:
+        return None
+
+
+def _load_chat_history(user_hash: str, limit: int = 5) -> list[dict]:
+    """
+    Load the last `limit` exchanges for a user as a list of
+    {role: 'user'|'assistant', content: str} dicts, oldest first.
+    Returns [] on any error so the bot degrades gracefully.
+    """
+    try:
+        user_id = _get_user_id(user_hash)
+        if not user_id:
+            return []
+        rows = (
+            supabase.table("chat_history")
+            .select("user_message, bot_response")
+            .eq("user_id", user_id)
+            .order("timestamp", desc=True)
+            .limit(limit)
+            .execute()
+        ).data
+        messages: list[dict] = []
+        for row in reversed(rows):          # oldest first
+            messages.append({"role": "user",      "content": row["user_message"]})
+            messages.append({"role": "assistant",  "content": row["bot_response"]})
+        return messages
+    except Exception as e:
+        print(f"[HISTORY] Load failed (non-fatal): {e}", file=sys.stderr)
+        return []
+
+
+def _save_chat_message(
+    user_hash: str,
+    user_message: str,
+    bot_response: str,
+    intent: str | None = None,
+) -> None:
+    """Persist a message exchange to chat_history. Silently skips on error."""
+    try:
+        user_id = _get_user_id(user_hash)
+        if not user_id:
+            return
+        supabase.table("chat_history").insert({
+            "user_id": user_id,
+            "user_message": user_message,
+            "bot_response": bot_response,
+            "intent_detected": intent,
+        }).execute()
+    except Exception as e:
+        print(f"[HISTORY] Save failed (non-fatal): {e}", file=sys.stderr)
+
+
+def _clear_chat_history(user_hash: str) -> None:
+    """Delete all chat history for a user."""
+    try:
+        user_id = _get_user_id(user_hash)
+        if user_id:
+            supabase.table("chat_history").delete().eq("user_id", user_id).execute()
+            print(f"[HISTORY] Cleared for {user_hash[:8]}", file=sys.stderr)
+    except Exception as e:
+        print(f"[HISTORY] Clear failed: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Webhook
 # ---------------------------------------------------------------------------
 
@@ -951,8 +1033,26 @@ def webhook():
         incoming_msg = request.form.get("Body", "").strip()
         print(f"[WEBHOOK] Received message from {user_hash[:8]}: '{incoming_msg[:50]}'", file=sys.stderr)
 
-        result = handle_message(incoming_msg)
+        # Handle "clear history" before anything else
+        if incoming_msg.lower() in ("clear history", "start fresh", "forget everything"):
+            _clear_chat_history(user_hash)
+            resp = MessagingResponse()
+            resp.message("Got it — I've cleared our conversation history. Fresh start!")
+            return str(resp), 200, {"Content-Type": "application/xml"}
+
+        # Load conversation history for LLM context
+        history = _load_chat_history(user_hash)
+
+        result = handle_message(incoming_msg, history=history)
         total_time = time.monotonic() - start
+
+        # Save this exchange to chat history (best-effort)
+        _save_chat_message(
+            user_hash,
+            incoming_msg,
+            result["content"],
+            result.get("intent"),
+        )
 
         _log_metric(
             user_hash=user_hash,
