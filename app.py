@@ -590,9 +590,9 @@ def _cmd_period_summary(txns: list[dict], date_label: str) -> str:
 # Intent Classification System
 # ---------------------------------------------------------------------------
 
-from date_parser import parse_date_range as _parse_date_range
-from intent_classifier import Intent, IntentClassifier
-from pdf_processor import process_pdf_upload
+from core.date_parser import parse_date_range as _parse_date_range
+from core.intent_classifier import Intent, IntentClassifier
+from core.pdf_processor import process_pdf_upload
 
 # Wire up Groq fast model for LLM-based intent classification fallback
 IntentClassifier.setup_llm(groq_client, GROQ_MODEL_FAST)
