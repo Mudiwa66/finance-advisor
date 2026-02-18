@@ -562,10 +562,13 @@ def ask_llm_with_tools(
     data_end = TRANSACTIONS[-1]["date"] if TRANSACTIONS else "N/A"
 
     system_msg = (
+        f"TODAY'S DATE: {today}. ALWAYS use this as the reference for ALL relative date "
+        f"calculations ('last week', 'past 4 weeks', 'this month', etc.). "
+        f"The statement period end date ({data_end}) is NOT today — do not use it as today.\n\n"
         f"{SPENDING_SUMMARY}\n\n"
-        f"Today is {today}. My transaction data covers {data_start} to {data_end}.\n"
+        f"Transaction data available: {data_start} to {data_end}.\n"
         "You have tools to query precise spending data. When the user mentions a time period, "
-        "resolve it to exact YYYY-MM-DD dates before calling tools. "
+        "resolve it to exact YYYY-MM-DD dates relative to TODAY before calling tools. "
         "Keep responses concise — this is WhatsApp, under 80 words. "
         "Use conversation history to resolve pronouns and follow-ups."
     )
