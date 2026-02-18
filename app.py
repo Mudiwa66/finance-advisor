@@ -785,6 +785,18 @@ def handle_message(body: str, history: list[dict] | None = None) -> dict:
             "confidence": confidence,
         }
 
+    # If classified as greeting but there's prior history and the message isn't
+    # an actual greeting word, treat it as a contextual follow-up instead so the
+    # LLM can answer using conversation context (e.g. "really?", "wow", "seriously")
+    REAL_GREETINGS = {"hi", "hello", "hey", "help", "helo", "howzit", "sup", "yo"}
+    if (
+        intent == Intent.GREETING
+        and history
+        and text.lower().strip("?!.") not in REAL_GREETINGS
+    ):
+        intent = Intent.GENERAL_FINANCIAL_ADVICE
+        print("[INTENT] Rerouted greeting→general (follow-up detected)", file=sys.stderr)
+
     # Route to appropriate handler, passing history for LLM context
     handler = INTENT_HANDLERS.get(intent, handle_unknown)
     result = handler(text, confidence, history=history or [])
