@@ -7,6 +7,7 @@ import random
 import re
 import sys
 import time
+from calendar import monthrange
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -362,6 +363,81 @@ MONTH_NAMES = {
 }
 
 # ---------------------------------------------------------------------------
+# Date filtering helpers
+# ---------------------------------------------------------------------------
+
+_DATE_TOKEN_RE = re.compile(
+    r"\b(in|on|for|during|last|this|past|the|next|"
+    r"january|jan|february|feb|march|mar|april|apr|june|jun|"
+    r"july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec|"
+    r"week|month|year|quarter|yesterday|today|ago|"
+    r"q[1-4]|first|second|third|fourth)\b"
+    r"|\b20\d{2}\b"
+    r"|\b\d+\s+days?\b",
+    re.IGNORECASE,
+)
+# "may" excluded — too ambiguous (modal verb)
+
+
+def _filter_transactions(txns: list[dict], start: datetime, end: datetime) -> list[dict]:
+    """Return transactions within [start, end] inclusive."""
+    s = start.strftime("%Y-%m-%d")
+    e = end.strftime("%Y-%m-%d")
+    return [t for t in txns if s <= t["date"] <= e]
+
+
+def _date_label(start: datetime, end: datetime) -> str:
+    """Human-readable label for a date range, e.g. 'in March', 'last month'."""
+    today = datetime.now().date()
+    s, e = start.date(), end.date()
+
+    if s == e:
+        if s == today:
+            return "today"
+        if s == today - timedelta(days=1):
+            return "yesterday"
+        return f"on {s.strftime('%-d %b %Y')}"
+
+    # Full calendar month
+    if s.day == 1 and e.day == monthrange(e.year, e.month)[1] and s.month == e.month and s.year == e.year:
+        return f"in {s.strftime('%B')}" if s.year == today.year else f"in {s.strftime('%B %Y')}"
+
+    # Full calendar year
+    if s == s.replace(month=1, day=1) and e == e.replace(month=12, day=31) and s.year == e.year:
+        return f"in {s.year}"
+
+    # Relative to today
+    if e == today:
+        delta = (e - s).days + 1
+        if delta == 7:
+            return "in the past week"
+        if delta == 30:
+            return "in the past 30 days"
+        return f"in the past {delta} days"
+
+    return f"from {s.strftime('%-d %b')} to {e.strftime('%-d %b %Y')}"
+
+
+_FILLER_RE = re.compile(
+    r"\b(how|much|what|did|i|me|my|tell|show|give|about|is|are|was|were|"
+    r"do|does|have|had|can|get|see|total|all|any|of|at|a|an|the|spend|spending)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_date_tokens(text: str) -> str:
+    """Remove date-related words so 'uber in march' → 'uber'."""
+    cleaned = _DATE_TOKEN_RE.sub(" ", text)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+def _extract_merchant_query(core: str) -> str:
+    """Strip filler question words from core to isolate merchant/category."""
+    cleaned = _FILLER_RE.sub(" ", core)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+# ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 
@@ -375,16 +451,19 @@ def cmd_help() -> str:
     ])
 
 
-def cmd_total_spending() -> str:
-    total = sum(t["amount"] for t in TRANSACTIONS if t["amount"] < 0)
-    count = sum(1 for t in TRANSACTIONS if t["amount"] < 0)
-    return f"Total spending: R{abs(total):,.2f}\n({count} transactions, Feb-May 2024)"
+def cmd_total_spending(txns: list[dict] | None = None, date_label: str = "all time") -> str:
+    data = txns if txns is not None else TRANSACTIONS
+    total = sum(t["amount"] for t in data if t["amount"] < 0)
+    count = sum(1 for t in data if t["amount"] < 0)
+    if count == 0:
+        return f"No spending found {date_label}."
+    return f"Total spending {date_label}: R{abs(total):,.2f}\n({count} transactions)"
 
 
 def cmd_income() -> str:
     total = sum(t["amount"] for t in TRANSACTIONS if t["amount"] > 0)
     count = sum(1 for t in TRANSACTIONS if t["amount"] > 0)
-    return f"Total income: R{total:,.2f}\n({count} transactions, Feb-May 2024)"
+    return f"Total income: R{total:,.2f}\n({count} transactions)"
 
 
 def cmd_balance() -> str:
@@ -392,16 +471,20 @@ def cmd_balance() -> str:
     return f"Closing balance: R{last['balance']:,.2f}\n(as of {last['date']})"
 
 
-def cmd_top_merchants() -> str:
+def cmd_top_merchants(txns: list[dict] | None = None, date_label: str = "all time") -> str:
+    data = txns if txns is not None else TRANSACTIONS
     spending: Counter[str] = Counter()
     counts: Counter[str] = Counter()
-    for t in TRANSACTIONS:
+    for t in data:
         if t["amount"] < 0:
             merchant = extract_merchant(t["description"])
             spending[merchant] += abs(t["amount"])
             counts[merchant] += 1
 
-    lines = ["Top 10 merchants by spending:\n"]
+    if not spending:
+        return f"No spending found {date_label}."
+
+    lines = [f"Top 10 merchants {date_label}:\n"]
     for i, (merchant, total) in enumerate(spending.most_common(10), 1):
         lines.append(f"{i}. {merchant}: R{total:,.2f} ({counts[merchant]}x)")
     return "\n".join(lines)
@@ -436,14 +519,22 @@ def cmd_month_spending(month_num: str) -> str:
     return "\n".join(lines)
 
 
-def cmd_merchant_search(query: str) -> str:
+def cmd_merchant_search(
+    query: str,
+    txns: list[dict] | None = None,
+    date_label: str = "all time",
+) -> str:
+    data = txns if txns is not None else TRANSACTIONS
     matches = []
-    for t in TRANSACTIONS:
+    for t in data:
         merchant = extract_merchant(t["description"])
         if query in merchant.lower() or query in t["description"].lower():
             matches.append((t, merchant))
 
     if not matches:
+        if txns is not None:
+            # Date filter was active — give targeted "no results" message
+            return f'No {query} spending {date_label}.'
         return (
             f'No transactions found matching "{query}".\n'
             "Try a merchant name like *uber*, *bolt*, *checkers*, or type *help*."
@@ -459,9 +550,9 @@ def cmd_merchant_search(query: str) -> str:
 
     if len(by_merchant) == 1:
         merchant_name = list(by_merchant.keys())[0]
-        return f"Spending at {merchant_name}: R{total:,.2f}\n({count} transactions, Feb-May 2024)"
+        return f"Spending at {merchant_name} {date_label}: R{total:,.2f}\n({count} transactions)"
 
-    lines = [f'Spending matching "{query}": R{total:,.2f} total\n']
+    lines = [f'Spending matching "{query}" {date_label}: R{total:,.2f} total\n']
     for merchant, amt in by_merchant.most_common(10):
         lines.append(f"  - {merchant}: R{amt:,.2f}")
     if len(by_merchant) > 10:
@@ -469,10 +560,37 @@ def cmd_merchant_search(query: str) -> str:
     return "\n".join(lines)
 
 
+def _cmd_period_summary(txns: list[dict], date_label: str) -> str:
+    """Full spending summary for a date period (used when query is just a date expression)."""
+    if not txns:
+        return f"No transactions found {date_label}."
+
+    debits = sum(t["amount"] for t in txns if t["amount"] < 0)
+    credits = sum(t["amount"] for t in txns if t["amount"] > 0)
+    debit_count = sum(1 for t in txns if t["amount"] < 0)
+
+    spending: Counter[str] = Counter()
+    for t in txns:
+        if t["amount"] < 0:
+            spending[extract_merchant(t["description"])] += abs(t["amount"])
+
+    lines = [
+        f"Summary {date_label}:",
+        f"  Spent: R{abs(debits):,.2f} ({debit_count} transactions)",
+        f"  Income: R{credits:,.2f}",
+    ]
+    if spending:
+        lines.append("\nTop merchants:")
+        for i, (merchant, amt) in enumerate(spending.most_common(5), 1):
+            lines.append(f"  {i}. {merchant}: R{amt:,.2f}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Intent Classification System
 # ---------------------------------------------------------------------------
 
+from date_parser import parse_date_range as _parse_date_range
 from intent_classifier import Intent, IntentClassifier
 from pdf_processor import process_pdf_upload
 
@@ -509,31 +627,62 @@ def handle_account_balance(message: str, confidence: float) -> dict:
 
 
 def handle_spending_query(message: str, confidence: float) -> dict:
-    """Handle spending-related queries."""
+    """Handle spending-related queries, with optional date filtering."""
     text = message.strip().lower()
+    today = datetime.now()
 
-    # Check for exact keyword matches first
-    if text in ("total spending", "total spend", "total debits", "total"):
-        return _keyword_result(cmd_total_spending())
+    # --- 1. Parse date range from the message ---
+    date_range = _parse_date_range(text)
+    filtered_txns: list[dict] | None = None
+    date_label = "all time"
+    start = end = None
 
-    if text in ("top merchants", "top spend", "top", "biggest", "top 10"):
-        return _keyword_result(cmd_top_merchants())
+    if date_range:
+        start, end = date_range
+        if start.date() > today.date():
+            return _keyword_result("That date is in the future! Try asking about past spending.")
+        # Cap end at today
+        if end.date() > today.date():
+            end = today
+        filtered_txns = _filter_transactions(TRANSACTIONS, start, end)
+        date_label = _date_label(start, end)
 
-    # Check for month keywords
-    for keyword, month_num in MONTH_KEYWORDS.items():
-        if keyword == text or text == f"{keyword} spending":
-            return _keyword_result(cmd_month_spending(month_num))
+    txns = filtered_txns if filtered_txns is not None else TRANSACTIONS
 
-    # Try merchant search for short queries
-    words = text.split()
-    if len(words) <= 3:
-        merchant_result = cmd_merchant_search(text)
-        if not merchant_result.startswith("No transactions found"):
-            return {"content": merchant_result, "used_llm": False, "intent": "spending_query", "confidence": confidence}
+    # --- 2. Strip date tokens to isolate the core query ---
+    core = _strip_date_tokens(text)
 
-    # Use LLM for complex spending queries
+    # --- 3. Exact keyword matches on core query ---
+    if core in ("total spending", "total spend", "total debits", "total", "spending", "spend", ""):
+        if not core or core in ("spending", "spend"):
+            # Bare date expression (e.g. "march", "last month") → period summary
+            return _keyword_result(_cmd_period_summary(txns, date_label))
+        return _keyword_result(cmd_total_spending(txns, date_label))
+
+    if core in ("top merchants", "top spend", "top", "biggest", "top 10"):
+        return _keyword_result(cmd_top_merchants(txns, date_label))
+
+    # --- 4. Merchant/category search ---
+    # Strip filler question words ("how much uber" → "uber")
+    merchant_query = _extract_merchant_query(core)
+    words = merchant_query.split()
+    if merchant_query and len(words) <= 3:
+        merchant_result = cmd_merchant_search(merchant_query, txns, date_label)
+        # Return if date was specified (even "no results") or a match was found
+        if filtered_txns is not None or not merchant_result.startswith("No transactions found"):
+            return {
+                "content": merchant_result,
+                "used_llm": False,
+                "intent": "spending_query",
+                "confidence": confidence,
+            }
+
+    # --- 5. LLM fallback for complex queries ---
+    llm_message = message
+    if date_range:
+        llm_message += f"\n[Date filter: {date_label} ({start.date()} to {end.date()})]"
     max_words = IntentClassifier.get_max_words(Intent.SPENDING_QUERY)
-    result = ask_llm(message, max_words=max_words)
+    result = ask_llm(llm_message, max_words=max_words)
     result["used_llm"] = True
     return result
 
