@@ -33,6 +33,12 @@ QUARTER_WORDS: dict[str, int] = {
     "first": 1, "second": 2, "third": 3, "fourth": 4,
 }
 
+WORD_NUMBERS: dict[str, int] = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+_WORD_NUM = "|".join(WORD_NUMBERS)
+
 _MONTH_RE = "(" + "|".join(MONTH_NAMES) + ")"
 
 
@@ -106,6 +112,14 @@ def parse_date_range(
         return _start(start.year, start.month, start.day), _end(today.year, today.month, today.day)
 
     # ---- Weeks ------------------------------------------------------------
+
+    # Past/last N weeks — "past two weeks", "last 3 weeks"
+    m = re.search(rf"\b(?:past|last)\s+(\d+|{_WORD_NUM})\s+weeks?\b", t)
+    if m:
+        raw = m.group(1)
+        n = int(raw) if raw.isdigit() else WORD_NUMBERS[raw]
+        start = today - timedelta(days=n * 7 - 1)
+        return _start(start.year, start.month, start.day), _end(today.year, today.month, today.day)
 
     if re.search(r"\b(?:past|last)\s+week\b", t):
         start = today - timedelta(days=6)

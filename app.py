@@ -383,10 +383,12 @@ _DATE_TOKEN_RE = re.compile(
     r"\b(in|on|for|during|last|this|past|the|next|"
     r"january|jan|february|feb|march|mar|april|apr|june|jun|"
     r"july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec|"
-    r"week|month|year|quarter|yesterday|today|ago|"
+    r"weeks?|months?|years?|quarter|yesterday|today|ago|"
     r"q[1-4]|first|second|third|fourth)\b"
     r"|\b20\d{2}\b"
-    r"|\b\d+\s+days?\b",
+    r"|\b\d+\s+days?\b"
+    # Word numbers only when directly followed by a time unit ("two weeks", "three months")
+    r"|\b(one|two|three|four|five|six|seven|eight|nine|ten)(?=\s+(?:week|month|day|year)s?\b)",
     re.IGNORECASE,
 )
 # "may" excluded — too ambiguous (modal verb)
@@ -433,7 +435,7 @@ def _date_label(start: datetime, end: datetime) -> str:
 
 _FILLER_RE = re.compile(
     r"\b(how|much|what|did|i|me|my|tell|show|give|about|is|are|was|were|"
-    r"do|does|have|had|can|get|see|total|all|any|of|at|a|an|the|spend|spending)\b",
+    r"do|does|have|had|can|get|see|total|all|any|of|at|a|an|the|spend|spending|and)\b",
     re.IGNORECASE,
 )
 
@@ -640,6 +642,8 @@ def handle_account_balance(message: str, confidence: float, history: list[dict] 
 def handle_spending_query(message: str, confidence: float, history: list[dict] | None = None) -> dict:
     """Handle spending-related queries, with optional date filtering."""
     text = message.strip().lower()
+    # Strip leading "and"/"and then" — context continuation from prior message
+    text = re.sub(r"^\s*and\s+(then\s+)?", "", text).strip()
     today = datetime.now()
 
     # --- 1. Parse date range from the message ---
@@ -657,11 +661,17 @@ def handle_spending_query(message: str, confidence: float, history: list[dict] |
             end = today
         filtered_txns = _filter_transactions(TRANSACTIONS, start, end)
         date_label = _date_label(start, end)
+        print(f"[SPENDING] Date range: {start.date()} → {end.date()} ({date_label})", file=sys.stderr)
+    else:
+        print(f"[SPENDING] No date range found, using all time. text='{text}'", file=sys.stderr)
 
     txns = filtered_txns if filtered_txns is not None else TRANSACTIONS
 
     # --- 2. Strip date tokens to isolate the core query ---
     core = _strip_date_tokens(text)
+    # Also remove any leftover punctuation that isn't part of a merchant name
+    core = re.sub(r"[^\w\s]", "", core).strip()
+    print(f"[SPENDING] core='{core}'", file=sys.stderr)
 
     # --- 3. Exact keyword matches on core query ---
     if core in ("total spending", "total spend", "total debits", "total", "spending", "spend", ""):
@@ -676,7 +686,15 @@ def handle_spending_query(message: str, confidence: float, history: list[dict] |
     # --- 4. Merchant/category search ---
     # Strip filler question words ("how much uber" → "uber")
     merchant_query = _extract_merchant_query(core)
+    # Drop any remaining punctuation-only content
+    merchant_query = re.sub(r"[^\w\s]", "", merchant_query).strip()
     words = merchant_query.split()
+    print(f"[SPENDING] merchant_query='{merchant_query}'", file=sys.stderr)
+
+    # If no specific merchant/category remains after stripping, treat as period summary
+    if not merchant_query:
+        return _keyword_result(_cmd_period_summary(txns, date_label))
+
     if merchant_query and len(words) <= 3:
         merchant_result = cmd_merchant_search(merchant_query, txns, date_label)
         # Return if date was specified (even "no results") or a match was found
