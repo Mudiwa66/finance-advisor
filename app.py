@@ -383,7 +383,7 @@ _DATE_TOKEN_RE = re.compile(
     r"\b(in|on|for|during|last|this|past|the|next|"
     r"january|jan|february|feb|march|mar|april|apr|june|jun|"
     r"july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec|"
-    r"weeks?|months?|years?|quarter|yesterday|today|ago|"
+    r"weeks?|months?|years?|quarter|yesterday|today|ago|before|"
     r"q[1-4]|first|second|third|fourth)\b"
     r"|\b20\d{2}\b"
     r"|\b\d+\s+days?\b"
@@ -471,6 +471,9 @@ def cmd_total_spending(txns: list[dict] | None = None, date_label: str = "all ti
     total = sum(t["amount"] for t in data if t["amount"] < 0)
     count = sum(1 for t in data if t["amount"] < 0)
     if count == 0:
+        if data is not TRANSACTIONS and TRANSACTIONS:
+            latest = TRANSACTIONS[-1]["date"]
+            return f"No spending found {date_label}. My data ends {latest}."
         return f"No spending found {date_label}."
     return f"Total spending {date_label}: R{abs(total):,.2f}\n({count} transactions)"
 
@@ -549,7 +552,10 @@ def cmd_merchant_search(
     if not matches:
         if txns is not None:
             # Date filter was active — give targeted "no results" message
-            return f'No {query} spending {date_label}.'
+            suffix = ""
+            if not txns and TRANSACTIONS:
+                suffix = f" My data ends {TRANSACTIONS[-1]['date']}."
+            return f'No {query} spending {date_label}.{suffix}'
         return (
             f'No transactions found matching "{query}".\n'
             "Try a merchant name like *uber*, *bolt*, *checkers*, or type *help*."
@@ -578,6 +584,14 @@ def cmd_merchant_search(
 def _cmd_period_summary(txns: list[dict], date_label: str) -> str:
     """Full spending summary for a date period (used when query is just a date expression)."""
     if not txns:
+        # Hint at the actual data coverage
+        if TRANSACTIONS:
+            latest = TRANSACTIONS[-1]["date"]
+            earliest = TRANSACTIONS[0]["date"]
+            return (
+                f"No transactions found {date_label}.\n"
+                f"My data covers {earliest} to {latest}."
+            )
         return f"No transactions found {date_label}."
 
     debits = sum(t["amount"] for t in txns if t["amount"] < 0)

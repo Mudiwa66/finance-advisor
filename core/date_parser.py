@@ -113,6 +113,12 @@ def parse_date_range(
 
     # ---- Weeks ------------------------------------------------------------
 
+    # "the week before (last week)" → the 7-day block ending 7 days before today
+    if re.search(r"\bthe\s+week\s+before\b", t):
+        end = today - timedelta(days=7)
+        start = end - timedelta(days=6)
+        return _start(start.year, start.month, start.day), _end(end.year, end.month, end.day)
+
     # Past/last N weeks — "past two weeks", "last 3 weeks"
     m = re.search(rf"\b(?:past|last)\s+(\d+|{_WORD_NUM})\s+weeks?\b", t)
     if m:
@@ -134,6 +140,15 @@ def parse_date_range(
 
     if re.search(r"\bthis\s+month\b", t):
         return _month_range(today.year, today.month)
+
+    # "the month before" → two months ago
+    if re.search(r"\bthe\s+month\s+before\b", t):
+        m2 = today.month - 2
+        y2 = today.year
+        if m2 <= 0:
+            m2 += 12
+            y2 -= 1
+        return _month_range(y2, m2)
 
     if re.search(r"\blast\s+month\b", t):
         if today.month == 1:
