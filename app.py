@@ -714,24 +714,24 @@ TOOLS = [
 ]
 
 
-def _parse_failed_generation(error_msg: str) -> tuple[str, dict] | None:
+def _parse_failed_generation(exc) -> tuple[str, dict] | None:
     """
-    Groq sometimes produces malformed function-call syntax, e.g.:
+    Groq sometimes produces correct args but malformed wrapper syntax:
         <function=set_budget{"category": "food", "amount": 1500}</function>
-    instead of the correct:
-        <function=set_budget>{"category": "food", "amount": 1500}</function>
 
-    The args are usually correct even when the wrapper syntax is wrong.
-    Extract tool name + args so we can execute the call ourselves.
+    Access e.body['error']['failed_generation'] directly (structured API
+    response) rather than parsing the stringified exception with regex.
     """
-    match = re.search(r"<function=(\w+)[>]?(.+?)</function>", error_msg, re.DOTALL)
-    if not match:
-        return None
-    tool_name = match.group(1)
-    args_str = match.group(2).strip().lstrip(">").strip()
     try:
-        return tool_name, json.loads(args_str)
-    except (json.JSONDecodeError, ValueError):
+        fg: str = exc.body["error"]["failed_generation"]
+    except (AttributeError, KeyError, TypeError):
+        return None
+    try:
+        # fg format: <function=TOOLNAME{JSON}</function>
+        tool_name = fg.split("=", 1)[1].split(">")[0].split("{")[0]
+        args = json.loads(fg[fg.index("{") : fg.rindex("}") + 1])
+        return tool_name, args
+    except (ValueError, json.JSONDecodeError):
         return None
 
 
@@ -933,10 +933,10 @@ def ask_llm_with_tools(
             user_msg = "Rate limit exceeded. Please try again in a moment."
         elif "invalid" in error_msg.lower() and "key" in error_msg.lower():
             user_msg = "API key is invalid. Please check your configuration."
-        elif "tool_use_failed" in error_msg or "tool call" in error_msg.lower():
+        elif getattr(e, "body", {}).get("error", {}).get("code") == "tool_use_failed":
             # Groq sometimes generates correct args but malformed wrapper syntax.
-            # Try to rescue the call by parsing failed_generation ourselves.
-            parsed = _parse_failed_generation(error_msg)
+            # Try to rescue the call by parsing e.body['error']['failed_generation'].
+            parsed = _parse_failed_generation(e)
             if parsed:
                 tool_name, tool_args = parsed
                 print(f"[TOOL] Recovering malformed call: {tool_name}({tool_args})", file=sys.stderr)
@@ -953,14 +953,15 @@ def ask_llm_with_tools(
                 except Exception as exec_err:
                     print(f"[TOOL] Recovery execution failed: {exec_err}", file=sys.stderr)
             # Parsing failed or execution failed — give contextual guidance.
-            if "set_budget" in error_msg:
+            failed_gen = e.body.get("error", {}).get("failed_generation", "")
+            if "set_budget" in failed_gen:
                 user_msg = (
                     "To set a budget I need a category and amount. "
                     "Try: 'Set food budget to R2000' or 'R500 weekly uber budget'."
                 )
-            elif "delete_budget" in error_msg:
+            elif "delete_budget" in failed_gen:
                 user_msg = "Which budget should I delete? E.g. 'Delete food budget'."
-            elif "get_budget" in error_msg or "list_budget" in error_msg:
+            elif "get_budget" in failed_gen or "list_budget" in failed_gen:
                 user_msg = "I couldn't retrieve your budgets right now. Try 'list budgets'."
             else:
                 user_msg = "I need more details. Could you be more specific?"
