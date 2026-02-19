@@ -172,7 +172,7 @@ def build_spending_summary() -> str:
     """Pre-compute a text summary of all transactions for the LLM system prompt."""
     if not TRANSACTIONS:
         return (
-            "You are a helpful financial assistant for a South African FNB bank account.\n"
+            "You are a helpful financial assistant for a South African.\n"
             "No transaction data is currently loaded. Please try again later or contact support."
         )
 
@@ -213,7 +213,7 @@ def build_spending_summary() -> str:
     )
 
     return (
-        f"You are a helpful financial assistant for a South African FNB bank account.\n"
+        f"You are a helpful financial assistant.\n"
         f"Statement period: {first_date} to {last_date}\n"
         f"Currency: South African Rand (ZAR), displayed as R.\n\n"
         f"ACCOUNT SUMMARY:\n"
@@ -379,6 +379,145 @@ def _tool_get_period_summary(
 
 
 # ---------------------------------------------------------------------------
+# Budget helpers
+# ---------------------------------------------------------------------------
+
+
+def _current_period_dates(period: str) -> tuple[str, str]:
+    """Return (date_from, date_to) for the current budget period."""
+    today = datetime.now().date()
+    if period == "weekly":
+        date_from = (today - timedelta(days=today.weekday())).isoformat()
+    else:  # monthly
+        date_from = today.replace(day=1).isoformat()
+    return date_from, today.isoformat()
+
+
+def _get_category_spending(category: str, date_from: str, date_to: str) -> float:
+    """Sum debits matching a category keyword in a date range."""
+    txns = _filter_by_dates(TRANSACTIONS, date_from, date_to)
+    q = category.lower()
+    return sum(
+        abs(t["amount"])
+        for t in txns
+        if t["amount"] < 0
+        and (q in extract_merchant(t["description"]).lower() or q in t["description"].lower())
+    )
+
+
+def _budget_status_line(cat: str, spent: float, limit: float, period: str) -> str:
+    pct = (spent / limit * 100) if limit > 0 else 0
+    remaining = limit - spent
+    period_label = "month" if period == "monthly" else "week"
+    if remaining < 0:
+        status = f"OVER by R{abs(remaining):,.2f}"
+    else:
+        status = f"R{remaining:,.2f} left"
+    return f"{cat.title()} ({period_label}): R{spent:,.2f} / R{limit:,.2f} ({pct:.0f}%) — {status}"
+
+
+# ---------------------------------------------------------------------------
+# Budget tool functions
+# ---------------------------------------------------------------------------
+
+
+def _tool_set_budget(user_id: str, category: str, amount: float, period: str = "monthly") -> str:
+    category = category.lower().strip()
+    if period not in ("monthly", "weekly"):
+        period = "monthly"
+    try:
+        supabase.table("user_budgets").upsert(
+            {
+                "user_id": user_id,
+                "category": category,
+                "amount": amount,
+                "period": period,
+                "active": True,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="user_id,category,period",
+        ).execute()
+        date_from, date_to = _current_period_dates(period)
+        spent = _get_category_spending(category, date_from, date_to)
+        period_label = "month" if period == "monthly" else "week"
+        pct = (spent / amount * 100) if amount > 0 else 0
+        return (
+            f"{category.title()} budget set: R{amount:,.2f}/{period_label}. "
+            f"Currently spent: R{spent:,.2f} ({pct:.0f}%). "
+            f"R{max(amount - spent, 0):,.2f} remaining."
+        )
+    except Exception as e:
+        return f"Failed to set budget: {e}"
+
+
+def _tool_get_budget_status(user_id: str, category: str | None = None) -> str:
+    try:
+        query = (
+            supabase.table("user_budgets")
+            .select("category, amount, period")
+            .eq("user_id", user_id)
+            .eq("active", True)
+        )
+        if category:
+            query = query.eq("category", category.lower().strip())
+        budgets = query.execute().data or []
+
+        if not budgets:
+            msg = f"No budget set for '{category}'." if category else "No budgets set yet."
+            return f"{msg} Use set_budget to create one."
+
+        lines = []
+        for b in budgets:
+            date_from, date_to = _current_period_dates(b["period"])
+            spent = _get_category_spending(b["category"], date_from, date_to)
+            lines.append(_budget_status_line(b["category"], spent, b["amount"], b["period"]))
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Failed to get budget status: {e}"
+
+
+def _tool_list_budgets(user_id: str) -> str:
+    try:
+        budgets = (
+            supabase.table("user_budgets")
+            .select("category, amount, period")
+            .eq("user_id", user_id)
+            .eq("active", True)
+            .order("category")
+            .execute()
+        ).data or []
+
+        if not budgets:
+            return "No active budgets. Use set_budget to create one."
+
+        lines = ["Active budgets:"]
+        for b in budgets:
+            period_label = "month" if b["period"] == "monthly" else "week"
+            lines.append(f"  - {b['category'].title()}: R{b['amount']:,.2f}/{period_label}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Failed to list budgets: {e}"
+
+
+def _tool_delete_budget(user_id: str, category: str, period: str = "monthly") -> str:
+    category = category.lower().strip()
+    try:
+        result = (
+            supabase.table("user_budgets")
+            .update({"active": False, "updated_at": datetime.now(timezone.utc).isoformat()})
+            .eq("user_id", user_id)
+            .eq("category", category)
+            .eq("period", period)
+            .execute()
+        )
+        if result.data:
+            return f"{category.title()} {period} budget deleted."
+        return f"No active {period} budget found for '{category}'."
+    except Exception as e:
+        return f"Failed to delete budget: {e}"
+
+
+# ---------------------------------------------------------------------------
 # Tool registry (Groq / OpenAI function calling format)
 # ---------------------------------------------------------------------------
 
@@ -490,10 +629,91 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_budget",
+            "description": (
+                "Create or update a spending budget for a category. "
+                "The category is a keyword matching merchant names (e.g. 'uber', 'woolworths', 'fuel') "
+                "or a broad label ('food', 'transport', 'entertainment'). "
+                "Immediately shows current spending vs the new limit."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "Budget category name (e.g. 'food', 'uber', 'transport').",
+                    },
+                    "amount": {
+                        "type": "number",
+                        "description": "Budget limit in South African Rand.",
+                    },
+                    "period": {
+                        "type": "string",
+                        "enum": ["monthly", "weekly"],
+                        "description": "Budget period: 'monthly' or 'weekly'. Default: monthly.",
+                    },
+                },
+                "required": ["category", "amount"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_budget_status",
+            "description": (
+                "Check spending vs budget limit for the current period. "
+                "Pass a category to check one budget, or omit to check all budgets."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "Category to check. Omit to check all active budgets.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_budgets",
+            "description": "List all active budgets with their limits and periods.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_budget",
+            "description": "Remove (deactivate) a budget for a category.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "Category name to delete.",
+                    },
+                    "period": {
+                        "type": "string",
+                        "enum": ["monthly", "weekly"],
+                        "description": "Period of the budget to delete. Default: monthly.",
+                    },
+                },
+                "required": ["category"],
+            },
+        },
+    },
 ]
 
 
-def _execute_tool(name: str, args: dict) -> str:
+def _execute_tool(name: str, args: dict, user_id: str | None = None) -> str:
     """Dispatch a tool call by name and return the string result."""
     if name == "get_balance":
         return _tool_get_balance()
@@ -519,6 +739,34 @@ def _execute_tool(name: str, args: dict) -> str:
             date_from=args.get("date_from"),
             date_to=args.get("date_to"),
         )
+    elif name == "set_budget":
+        if not user_id:
+            return "Cannot set budget: user not identified."
+        return _tool_set_budget(
+            user_id=user_id,
+            category=args["category"],
+            amount=float(args["amount"]),
+            period=args.get("period", "monthly"),
+        )
+    elif name == "get_budget_status":
+        if not user_id:
+            return "Cannot get budget status: user not identified."
+        return _tool_get_budget_status(
+            user_id=user_id,
+            category=args.get("category"),
+        )
+    elif name == "list_budgets":
+        if not user_id:
+            return "Cannot list budgets: user not identified."
+        return _tool_list_budgets(user_id=user_id)
+    elif name == "delete_budget":
+        if not user_id:
+            return "Cannot delete budget: user not identified."
+        return _tool_delete_budget(
+            user_id=user_id,
+            category=args["category"],
+            period=args.get("period", "monthly"),
+        )
     else:
         return f"Unknown tool: {name}"
 
@@ -531,6 +779,7 @@ def _execute_tool(name: str, args: dict) -> str:
 def ask_llm_with_tools(
     message: str,
     history: list[dict] | None = None,
+    user_id: str | None = None,
 ) -> dict:
     """
     Send a message to Groq with tool calling enabled.
@@ -613,7 +862,7 @@ def ask_llm_with_tools(
             tool_args = json.loads(tool_call.function.arguments)
             print(f"[TOOL] {tool_name}({tool_args})", file=sys.stderr)
 
-            tool_result = _execute_tool(tool_name, tool_args)
+            tool_result = _execute_tool(tool_name, tool_args, user_id=user_id)
             print(f"[TOOL] Result: {tool_result[:120]}", file=sys.stderr)
 
             messages.append({
@@ -672,7 +921,11 @@ GREETING_WORDS = {"hi", "hello", "hey", "help", "helo", "howzit", "sup", "yo", "
 BALANCE_WORDS = {"balance", "closing balance", "current balance", "my balance"}
 
 
-def handle_message(body: str, history: list[dict] | None = None) -> dict:
+def handle_message(
+    body: str,
+    history: list[dict] | None = None,
+    user_id: str | None = None,
+) -> dict:
     """
     Route an incoming message.
 
@@ -703,7 +956,7 @@ def handle_message(body: str, history: list[dict] | None = None) -> dict:
         }
 
     # Tool calling for all spending queries and general questions
-    result = ask_llm_with_tools(text, history=history)
+    result = ask_llm_with_tools(text, history=history, user_id=user_id)
     result["intent"] = "tool_call"
     result["confidence"] = 1.0
     return result
@@ -939,10 +1192,11 @@ def webhook():
             resp.message("Got it — I've cleared our conversation history. Fresh start!")
             return str(resp), 200, {"Content-Type": "application/xml"}
 
-        # Load conversation history for LLM context
+        # Load conversation history and resolve user_id for budget tools
+        user_id = _get_user_id(user_hash)
         history = _load_chat_history(user_hash)
 
-        result = handle_message(incoming_msg, history=history)
+        result = handle_message(incoming_msg, history=history, user_id=user_id)
         total_time = time.monotonic() - start
 
         _save_chat_message(

@@ -7,6 +7,7 @@ are called.
 """
 
 import pytest
+from datetime import datetime
 from unittest.mock import patch
 
 import app
@@ -294,6 +295,167 @@ class TestToolGetPeriodSummary:
         # No date filter → all transactions included
         assert "2,240.50" in result   # total debits across all sample data
         assert "25,000.00" in result  # total credits across all sample data
+
+
+# ---------------------------------------------------------------------------
+# Budget helpers
+# ---------------------------------------------------------------------------
+
+TEST_USER_ID = "00000000-0000-0000-0000-000000000001"
+
+
+class TestCurrentPeriodDates:
+    def test_monthly_starts_on_first(self):
+        date_from, date_to = app._current_period_dates("monthly")
+        assert date_from.endswith("-01")
+        assert date_to == datetime.now().strftime("%Y-%m-%d")
+
+    def test_weekly_starts_on_monday(self):
+        date_from, _ = app._current_period_dates("weekly")
+        from datetime import datetime as dt
+        day = dt.strptime(date_from, "%Y-%m-%d").weekday()
+        assert day == 0  # Monday = 0
+
+    def test_unknown_period_defaults_to_monthly(self):
+        date_from_monthly, _ = app._current_period_dates("monthly")
+        date_from_unknown, _ = app._current_period_dates("bogus")
+        assert date_from_monthly == date_from_unknown
+
+
+class TestGetCategorySpending:
+    def test_matches_merchant_keyword(self):
+        spent = app._get_category_spending("uber", "2026-01-01", "2026-01-31")
+        assert spent == 350.0  # 150 + 200
+
+    def test_case_insensitive(self):
+        lower = app._get_category_spending("woolworths", "2026-01-01", "2026-12-31")
+        upper = app._get_category_spending("WOOLWORTHS", "2026-01-01", "2026-12-31")
+        assert lower == upper
+
+    def test_credits_not_counted(self):
+        spent = app._get_category_spending("rtc", "2026-01-01", "2026-01-31")
+        assert spent == 0.0
+
+    def test_no_match_returns_zero(self):
+        spent = app._get_category_spending("kfc", "2026-01-01", "2026-12-31")
+        assert spent == 0.0
+
+    def test_date_range_filters_correctly(self):
+        # Only Feb transactions
+        spent = app._get_category_spending("woolworths", "2026-02-01", "2026-02-28")
+        assert spent == 290.0
+
+
+class TestBudgetStatusLine:
+    def test_under_budget(self):
+        line = app._budget_status_line("food", 500.0, 2000.0, "monthly")
+        assert "food" in line.lower()
+        assert "R1,500.00 left" in line
+        assert "25%" in line
+
+    def test_over_budget(self):
+        line = app._budget_status_line("food", 2500.0, 2000.0, "monthly")
+        assert "OVER" in line
+        assert "R500.00" in line
+
+    def test_weekly_label(self):
+        line = app._budget_status_line("transport", 100.0, 500.0, "weekly")
+        assert "week" in line
+
+
+class TestToolSetBudget:
+    def test_set_budget_calls_supabase_upsert(self):
+        from unittest.mock import MagicMock, patch
+        mock_result = MagicMock()
+        mock_result.data = [{"id": "abc", "category": "uber", "amount": 1000.0}]
+
+        with patch.object(app.supabase.table("user_budgets"), "upsert") as mock_upsert:
+            mock_upsert.return_value.execute.return_value = mock_result
+            result = app._tool_set_budget(TEST_USER_ID, "Uber", 1000.0, "monthly")
+
+        # Should contain budget confirmation text
+        assert "uber" in result.lower()
+        assert "1,000.00" in result
+
+    def test_normalises_category_to_lowercase(self):
+        from unittest.mock import MagicMock, patch
+        with patch.object(app.supabase, "table") as mock_table:
+            mock_table.return_value.upsert.return_value.execute.return_value = MagicMock(data=[{}])
+            result = app._tool_set_budget(TEST_USER_ID, "FOOD", 2000.0)
+        assert "food" in result.lower()
+
+    def test_invalid_period_defaults_to_monthly(self):
+        from unittest.mock import MagicMock, patch
+        with patch.object(app.supabase, "table") as mock_table:
+            mock_table.return_value.upsert.return_value.execute.return_value = MagicMock(data=[{}])
+            result = app._tool_set_budget(TEST_USER_ID, "food", 500.0, "yearly")
+        assert "month" in result
+
+
+class TestToolGetBudgetStatus:
+    def test_no_budgets_returns_helpful_message(self):
+        from unittest.mock import MagicMock, patch
+        with patch.object(app.supabase, "table") as mock_table:
+            chain = MagicMock()
+            chain.select.return_value = chain
+            chain.eq.return_value = chain
+            chain.execute.return_value = MagicMock(data=[])
+            mock_table.return_value = chain
+
+            result = app._tool_get_budget_status(TEST_USER_ID)
+        assert "No budgets" in result
+
+    def test_returns_status_for_each_budget(self):
+        from unittest.mock import MagicMock, patch
+        budgets = [
+            {"category": "uber", "amount": 1000.0, "period": "monthly"},
+            {"category": "food", "amount": 2000.0, "period": "monthly"},
+        ]
+        with patch.object(app.supabase, "table") as mock_table:
+            chain = MagicMock()
+            chain.select.return_value = chain
+            chain.eq.return_value = chain
+            chain.execute.return_value = MagicMock(data=budgets)
+            mock_table.return_value = chain
+
+            result = app._tool_get_budget_status(TEST_USER_ID)
+        assert "Uber" in result
+        assert "Food" in result
+
+
+class TestToolListBudgets:
+    def test_empty_returns_helpful_message(self):
+        from unittest.mock import MagicMock, patch
+        with patch.object(app.supabase, "table") as mock_table:
+            chain = MagicMock()
+            chain.select.return_value = chain
+            chain.eq.return_value = chain
+            chain.order.return_value = chain
+            chain.execute.return_value = MagicMock(data=[])
+            mock_table.return_value = chain
+
+            result = app._tool_list_budgets(TEST_USER_ID)
+        assert "No active budgets" in result
+
+    def test_lists_all_budgets(self):
+        from unittest.mock import MagicMock, patch
+        budgets = [
+            {"category": "food", "amount": 2000.0, "period": "monthly"},
+            {"category": "transport", "amount": 800.0, "period": "weekly"},
+        ]
+        with patch.object(app.supabase, "table") as mock_table:
+            chain = MagicMock()
+            chain.select.return_value = chain
+            chain.eq.return_value = chain
+            chain.order.return_value = chain
+            chain.execute.return_value = MagicMock(data=budgets)
+            mock_table.return_value = chain
+
+            result = app._tool_list_budgets(TEST_USER_ID)
+        assert "Food" in result
+        assert "Transport" in result
+        assert "R2,000.00/month" in result
+        assert "R800.00/week" in result
 
 
 # ---------------------------------------------------------------------------
