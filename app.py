@@ -647,8 +647,7 @@ TOOLS = [
                         "description": "Budget category name (e.g. 'food', 'uber', 'transport').",
                     },
                     "amount": {
-                        "type": "number",
-                        "description": "Budget limit in South African Rand.",
+                        "description": "Budget limit in South African Rand (numeric value, e.g. 500 or 1000).",
                     },
                     "period": {
                         "type": "string",
