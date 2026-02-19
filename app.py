@@ -714,6 +714,27 @@ TOOLS = [
 ]
 
 
+def _parse_failed_generation(error_msg: str) -> tuple[str, dict] | None:
+    """
+    Groq sometimes produces malformed function-call syntax, e.g.:
+        <function=set_budget{"category": "food", "amount": 1500}</function>
+    instead of the correct:
+        <function=set_budget>{"category": "food", "amount": 1500}</function>
+
+    The args are usually correct even when the wrapper syntax is wrong.
+    Extract tool name + args so we can execute the call ourselves.
+    """
+    match = re.search(r"<function=(\w+)[>]?(.+?)</function>", error_msg, re.DOTALL)
+    if not match:
+        return None
+    tool_name = match.group(1)
+    args_str = match.group(2).strip().lstrip(">").strip()
+    try:
+        return tool_name, json.loads(args_str)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
 def _execute_tool(name: str, args: dict, user_id: str | None = None) -> str:
     """Dispatch a tool call by name and return the string result."""
     if name == "get_balance":
@@ -913,8 +934,25 @@ def ask_llm_with_tools(
         elif "invalid" in error_msg.lower() and "key" in error_msg.lower():
             user_msg = "API key is invalid. Please check your configuration."
         elif "tool_use_failed" in error_msg or "tool call" in error_msg.lower():
-            # Groq failed to generate a valid tool call — usually missing params.
-            # Give context-specific guidance based on which tool was attempted.
+            # Groq sometimes generates correct args but malformed wrapper syntax.
+            # Try to rescue the call by parsing failed_generation ourselves.
+            parsed = _parse_failed_generation(error_msg)
+            if parsed:
+                tool_name, tool_args = parsed
+                print(f"[TOOL] Recovering malformed call: {tool_name}({tool_args})", file=sys.stderr)
+                try:
+                    tool_result = _execute_tool(tool_name, tool_args, user_id=user_id)
+                    elapsed = time.monotonic() - start
+                    return {
+                        "content": tool_result,
+                        "llm_time": round(elapsed, 3),
+                        "tokens": 0,
+                        "used_llm": True,
+                        "error": False,
+                    }
+                except Exception as exec_err:
+                    print(f"[TOOL] Recovery execution failed: {exec_err}", file=sys.stderr)
+            # Parsing failed or execution failed — give contextual guidance.
             if "set_budget" in error_msg:
                 user_msg = (
                     "To set a budget I need a category and amount. "
