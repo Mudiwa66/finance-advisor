@@ -635,24 +635,26 @@ TOOLS = [
             "name": "set_budget",
             "description": (
                 "Create or update a spending budget for a category. "
-                "The category is a keyword matching merchant names (e.g. 'uber', 'woolworths', 'fuel') "
-                "or a broad label ('food', 'transport', 'entertainment'). "
-                "Immediately shows current spending vs the new limit."
+                "ONLY call this when the user has explicitly stated BOTH a category AND a specific rand amount. "
+                "If either is missing from the user's message, ask for it — do NOT guess or use defaults. "
+                "The category matches merchant names (e.g. 'uber', 'woolworths', 'fuel') "
+                "or broad labels ('food', 'transport', 'entertainment'). "
+                "Example trigger: 'set food budget to R2000' or 'budget R500 for uber'."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "category": {
                         "type": "string",
-                        "description": "Budget category name (e.g. 'food', 'uber', 'transport').",
+                        "description": "Category name explicitly stated by the user (e.g. 'food', 'uber', 'transport'). Must come from user input, not assumed.",
                     },
                     "amount": {
-                        "description": "Budget limit in South African Rand (numeric value, e.g. 500 or 1000).",
+                        "description": "Rand amount explicitly stated by the user (e.g. 2000 for 'R2000'). Must come from user input, not assumed.",
                     },
                     "period": {
                         "type": "string",
                         "enum": ["monthly", "weekly"],
-                        "description": "Budget period: 'monthly' or 'weekly'. Default: monthly.",
+                        "description": "Budget period stated by the user. Default: monthly.",
                     },
                 },
                 "required": ["category", "amount"],
@@ -810,9 +812,19 @@ def ask_llm_with_tools(
         f"calculations ('last week', 'past 4 weeks', 'this month', etc.). "
         f"The statement period end date ({data_end}) is NOT today — do not use it as today.\n\n"
         f"{SPENDING_SUMMARY}\n\n"
-        f"Transaction data available: {data_start} to {data_end}.\n"
-        "You have tools to query precise spending data. When the user mentions a time period, "
-        "resolve it to exact YYYY-MM-DD dates relative to TODAY before calling tools. "
+        f"Transaction data available: {data_start} to {data_end}.\n\n"
+        "TOOL CALLING RULES:\n"
+        "- Only call a tool when the user has EXPLICITLY provided all required parameters.\n"
+        "- NEVER guess, invent, or assume parameter values.\n"
+        "- For set_budget: ONLY call if the user stated BOTH a category AND a specific amount. "
+        "If either is missing, ask for them conversationally.\n"
+        "- For help/guidance requests ('can you help me', 'how do I', 'what should I'), "
+        "respond conversationally — do NOT call any tool.\n"
+        "Good: 'Set food budget R2000' → call set_budget(category='food', amount=2000)\n"
+        "Bad:  'Can you help me create a budget?' → DO NOT call set_budget. Instead reply: "
+        "'Sure! Which category (e.g. food, transport, entertainment) and what monthly amount?'\n\n"
+        "When the user mentions a time period, resolve it to exact YYYY-MM-DD dates relative "
+        "to TODAY before calling tools. "
         "Keep responses concise — this is WhatsApp, under 80 words. "
         "Use conversation history to resolve pronouns and follow-ups."
     )
@@ -900,6 +912,20 @@ def ask_llm_with_tools(
             user_msg = "Rate limit exceeded. Please try again in a moment."
         elif "invalid" in error_msg.lower() and "key" in error_msg.lower():
             user_msg = "API key is invalid. Please check your configuration."
+        elif "tool_use_failed" in error_msg or "tool call" in error_msg.lower():
+            # Groq failed to generate a valid tool call — usually missing params.
+            # Give context-specific guidance based on which tool was attempted.
+            if "set_budget" in error_msg:
+                user_msg = (
+                    "To set a budget I need a category and amount. "
+                    "Try: 'Set food budget to R2000' or 'R500 weekly uber budget'."
+                )
+            elif "delete_budget" in error_msg:
+                user_msg = "Which budget should I delete? E.g. 'Delete food budget'."
+            elif "get_budget" in error_msg or "list_budget" in error_msg:
+                user_msg = "I couldn't retrieve your budgets right now. Try 'list budgets'."
+            else:
+                user_msg = "I need more details. Could you be more specific?"
         else:
             user_msg = "Sorry, I couldn't process that right now."
 
