@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -519,6 +520,215 @@ def _tool_delete_budget(user_id: str, category: str, period: str = "monthly") ->
 
 
 # ---------------------------------------------------------------------------
+# Debt tool functions
+# ---------------------------------------------------------------------------
+
+_DEBT_COLS = "creditor_name, debt_type, amount_owed, interest_rate, minimum_payment, payment_day"
+
+
+def _months_to_payoff(balance: float, annual_rate: float, monthly_payment: float) -> int | None:
+    """Standard amortisation formula. Returns None if payment can't cover interest."""
+    if monthly_payment <= 0 or balance <= 0:
+        return None
+    monthly_rate = annual_rate / 100 / 12
+    if monthly_rate == 0:
+        return math.ceil(balance / monthly_payment)
+    if monthly_payment <= balance * monthly_rate:
+        return None  # payment too small to ever pay off
+    n = -math.log(1 - (monthly_rate * balance) / monthly_payment) / math.log(1 + monthly_rate)
+    return math.ceil(n)
+
+
+def _default_min_payment(amount_owed: float) -> float:
+    """Estimate minimum payment when none is recorded: 3% of balance, min R200."""
+    return max(round(amount_owed * 0.03, 2), 200.0)
+
+
+def _tool_add_debt(
+    user_id: str,
+    creditor_name: str,
+    amount_owed: float,
+    interest_rate: float,
+    debt_type: str = "other",
+    minimum_payment: float | None = None,
+) -> str:
+    valid_types = ("credit_card", "personal_loan", "overdraft", "store_credit", "payday_loan", "other")
+    if debt_type not in valid_types:
+        debt_type = "other"
+    try:
+        row: dict = {
+            "user_id": user_id,
+            "creditor_name": creditor_name.strip(),
+            "debt_type": debt_type,
+            "amount_owed": amount_owed,
+            "interest_rate": interest_rate,
+            "active": True,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if minimum_payment is not None:
+            row["minimum_payment"] = minimum_payment
+        supabase.table("user_debts").upsert(row, on_conflict="user_id,creditor_name").execute()
+        monthly_interest = amount_owed * interest_rate / 100 / 12
+        return (
+            f"{creditor_name} debt recorded: R{amount_owed:,.2f} at {interest_rate}% p.a. "
+            f"(≈R{monthly_interest:,.2f}/month in interest)."
+        )
+    except Exception as e:
+        return f"Failed to add debt: {e}"
+
+
+def _tool_get_debt_summary(user_id: str) -> str:
+    try:
+        debts = (
+            supabase.table("user_debts")
+            .select(_DEBT_COLS)
+            .eq("user_id", user_id)
+            .eq("active", True)
+            .order("amount_owed", desc=True)
+            .execute()
+        ).data or []
+
+        if not debts:
+            return "No debts recorded. Use add_debt to track what you owe."
+
+        total = sum(float(d["amount_owed"]) for d in debts)
+        total_monthly_interest = sum(
+            float(d["amount_owed"]) * float(d["interest_rate"]) / 100 / 12 for d in debts
+        )
+        lines = [f"Total owed: R{total:,.2f} across {len(debts)} debt(s) (R{total_monthly_interest:,.2f}/month interest):"]
+        for d in debts:
+            min_pay = float(d["minimum_payment"]) if d["minimum_payment"] else _default_min_payment(float(d["amount_owed"]))
+            lines.append(
+                f"  - {d['creditor_name']}: R{float(d['amount_owed']):,.2f} @ {d['interest_rate']}% "
+                f"(min R{min_pay:,.0f}/mo)"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Failed to get debt summary: {e}"
+
+
+def _tool_get_debt_payoff_plan(user_id: str, strategy: str = "avalanche") -> str:
+    try:
+        debts = (
+            supabase.table("user_debts")
+            .select(_DEBT_COLS)
+            .eq("user_id", user_id)
+            .eq("active", True)
+            .execute()
+        ).data or []
+
+        if not debts:
+            return "No debts recorded."
+
+        if strategy == "snowball":
+            debts.sort(key=lambda d: float(d["amount_owed"]))
+            label = "Snowball (smallest balance first — quickest psychological wins)"
+        else:
+            strategy = "avalanche"
+            debts.sort(key=lambda d: float(d["interest_rate"]), reverse=True)
+            label = "Avalanche (highest interest first — minimises total interest paid)"
+
+        total_owed = sum(float(d["amount_owed"]) for d in debts)
+        total_min = sum(
+            float(d["minimum_payment"]) if d["minimum_payment"]
+            else _default_min_payment(float(d["amount_owed"]))
+            for d in debts
+        )
+
+        lines = [f"{label}:", f"Total: R{total_owed:,.2f} | Min payments: R{total_min:,.0f}/mo", ""]
+        for i, d in enumerate(debts, 1):
+            owed = float(d["amount_owed"])
+            rate = float(d["interest_rate"])
+            min_pay = float(d["minimum_payment"]) if d["minimum_payment"] else _default_min_payment(owed)
+            months = _months_to_payoff(owed, rate, min_pay)
+            time_str = f"~{months}mo" if months else "interest-only"
+            lines.append(
+                f"  {i}. {d['creditor_name']} — R{owed:,.0f} @ {rate}% → {time_str} at R{min_pay:,.0f}/mo"
+            )
+
+        lines.append("")
+        lines.append(
+            "Tip: put any extra money toward debt #1. Once it's paid, roll that payment into #2."
+        )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Failed to compute payoff plan: {e}"
+
+
+def _tool_update_debt(user_id: str, creditor_name: str, new_amount: float) -> str:
+    try:
+        result = (
+            supabase.table("user_debts")
+            .update({
+                "amount_owed": new_amount,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("user_id", user_id)
+            .ilike("creditor_name", creditor_name.strip())
+            .eq("active", True)
+            .execute()
+        )
+        if not result.data:
+            return f"No active debt found for '{creditor_name}'. Check the name and try again."
+        old_name = result.data[0]["creditor_name"]
+        return f"{old_name} updated to R{new_amount:,.2f}."
+    except Exception as e:
+        return f"Failed to update debt: {e}"
+
+
+def _tool_mark_debt_paid(user_id: str, creditor_name: str) -> str:
+    try:
+        result = (
+            supabase.table("user_debts")
+            .update({
+                "active": False,
+                "amount_owed": 0,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("user_id", user_id)
+            .ilike("creditor_name", creditor_name.strip())
+            .eq("active", True)
+            .execute()
+        )
+        if not result.data:
+            return f"No active debt found for '{creditor_name}'."
+        # Get remaining total
+        remaining = (
+            supabase.table("user_debts")
+            .select("amount_owed")
+            .eq("user_id", user_id)
+            .eq("active", True)
+            .execute()
+        ).data or []
+        total_remaining = sum(float(d["amount_owed"]) for d in remaining)
+        paid_name = result.data[0]["creditor_name"]
+        if total_remaining == 0:
+            return f"{paid_name} paid off! You are completely debt-free!"
+        return f"{paid_name} paid off! Total debt now R{total_remaining:,.2f}. Keep going!"
+    except Exception as e:
+        return f"Failed to mark debt as paid: {e}"
+
+
+def _tool_delete_debt(user_id: str, creditor_name: str) -> str:
+    try:
+        result = (
+            supabase.table("user_debts")
+            .update({
+                "active": False,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("user_id", user_id)
+            .ilike("creditor_name", creditor_name.strip())
+            .execute()
+        )
+        if not result.data:
+            return f"No debt found for '{creditor_name}'."
+        return f"{result.data[0]['creditor_name']} debt removed."
+    except Exception as e:
+        return f"Failed to delete debt: {e}"
+
+
+# ---------------------------------------------------------------------------
 # Tool registry (Groq / OpenAI function calling format)
 # ---------------------------------------------------------------------------
 
@@ -712,6 +922,136 @@ TOOLS = [
             },
         },
     },
+    # -----------------------------------------------------------------------
+    # Debt tools
+    # -----------------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "add_debt",
+            "description": (
+                "Record a new debt or update an existing one. "
+                "ONLY call when the user has explicitly stated BOTH a creditor name AND an amount. "
+                "Examples: 'I owe ABSA R15000 at 18%', 'Add Mr Price store account R5000 at 22%'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "creditor_name": {
+                        "type": "string",
+                        "description": "Name of the lender/creditor as stated by the user (e.g. 'ABSA', 'Mr Price', 'Capitec').",
+                    },
+                    "amount_owed": {
+                        "description": "Current balance owed in Rand, explicitly stated by the user.",
+                    },
+                    "interest_rate": {
+                        "description": "Annual interest rate as a percentage (e.g. 18 for 18%), stated by the user.",
+                    },
+                    "debt_type": {
+                        "type": "string",
+                        "enum": ["credit_card", "personal_loan", "overdraft", "store_credit", "payday_loan", "other"],
+                        "description": "Type of debt. Infer from context if clear, otherwise use 'other'.",
+                    },
+                    "minimum_payment": {
+                        "description": "Minimum monthly payment in Rand if stated by the user. Omit if not mentioned.",
+                    },
+                },
+                "required": ["creditor_name", "amount_owed", "interest_rate"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_debt_summary",
+            "description": "Show all active debts with total owed and monthly interest. Use when user asks 'show my debts', 'what do I owe', 'debt summary'.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_debt_payoff_plan",
+            "description": (
+                "Generate an optimal debt payoff plan. "
+                "Avalanche (default) = highest interest first, minimises total interest. "
+                "Snowball = smallest balance first, quickest wins. "
+                "Use when user asks 'how do I pay off my debt', 'best way to pay debt', 'debt free plan'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["avalanche", "snowball"],
+                        "description": "Payoff strategy. Default: avalanche.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_debt",
+            "description": (
+                "Update the balance on an existing debt after a payment. "
+                "ONLY call when the user states a NEW balance or says they paid a specific amount. "
+                "Example: 'I paid R2000 to ABSA' or 'ABSA balance is now R13000'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "creditor_name": {
+                        "type": "string",
+                        "description": "Name of the creditor to update.",
+                    },
+                    "new_amount": {
+                        "description": "New balance remaining after payment, in Rand.",
+                    },
+                },
+                "required": ["creditor_name", "new_amount"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mark_debt_paid",
+            "description": (
+                "Mark a debt as fully paid off. "
+                "Use when user says '[creditor] is paid off', '[creditor] done', 'finished paying [creditor]'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "creditor_name": {
+                        "type": "string",
+                        "description": "Name of the creditor that has been paid off.",
+                    },
+                },
+                "required": ["creditor_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_debt",
+            "description": "Remove a debt record entirely (use mark_debt_paid instead if fully paid off).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "creditor_name": {
+                        "type": "string",
+                        "description": "Name of the creditor to remove.",
+                    },
+                },
+                "required": ["creditor_name"],
+            },
+        },
+    },
 ]
 
 
@@ -790,6 +1130,44 @@ def _execute_tool(name: str, args: dict, user_id: str | None = None) -> str:
             category=args["category"],
             period=args.get("period", "monthly"),
         )
+    elif name == "add_debt":
+        if not user_id:
+            return "Cannot add debt: user not identified."
+        return _tool_add_debt(
+            user_id=user_id,
+            creditor_name=args["creditor_name"],
+            amount_owed=float(args["amount_owed"]),
+            interest_rate=float(args["interest_rate"]),
+            debt_type=args.get("debt_type", "other"),
+            minimum_payment=float(args["minimum_payment"]) if args.get("minimum_payment") else None,
+        )
+    elif name == "get_debt_summary":
+        if not user_id:
+            return "Cannot get debt summary: user not identified."
+        return _tool_get_debt_summary(user_id=user_id)
+    elif name == "get_debt_payoff_plan":
+        if not user_id:
+            return "Cannot get payoff plan: user not identified."
+        return _tool_get_debt_payoff_plan(
+            user_id=user_id,
+            strategy=args.get("strategy", "avalanche"),
+        )
+    elif name == "update_debt":
+        if not user_id:
+            return "Cannot update debt: user not identified."
+        return _tool_update_debt(
+            user_id=user_id,
+            creditor_name=args["creditor_name"],
+            new_amount=float(args["new_amount"]),
+        )
+    elif name == "mark_debt_paid":
+        if not user_id:
+            return "Cannot mark debt paid: user not identified."
+        return _tool_mark_debt_paid(user_id=user_id, creditor_name=args["creditor_name"])
+    elif name == "delete_debt":
+        if not user_id:
+            return "Cannot delete debt: user not identified."
+        return _tool_delete_debt(user_id=user_id, creditor_name=args["creditor_name"])
     else:
         return f"Unknown tool: {name}"
 
@@ -851,7 +1229,11 @@ def ask_llm_with_tools(
         "Good: 'Set food budget R2000' → call set_budget(category='food', amount=2000)\n"
         "Good: 'work transport' (after being asked category) + 'R800' (after being asked amount) → call set_budget\n"
         "Bad:  'work transport' alone → DO NOT call set_budget, ask for the amount first.\n"
-        "Bad:  'for month of march' after budget confirmed → DO NOT call set_budget again.\n\n"
+        "Bad:  'for month of march' after budget confirmed → DO NOT call set_budget again.\n"
+        "- For add_debt: ONLY call if the user stated BOTH a creditor name AND an amount AND an interest rate.\n"
+        "- For update_debt: 'I paid R2000 to ABSA' means new_amount = current_balance - 2000 (compute it). "
+        "'ABSA balance is now R13000' means new_amount = 13000 directly.\n"
+        "- For mark_debt_paid: use only when user explicitly says a debt is fully paid off.\n\n"
         "When the user mentions a time period, resolve it to exact YYYY-MM-DD dates relative "
         "to TODAY before calling tools. "
         "Keep responses concise — this is WhatsApp, under 80 words. "
