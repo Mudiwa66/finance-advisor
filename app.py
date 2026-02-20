@@ -100,37 +100,38 @@ if not TRANSACTIONS:
 # Merchant extraction
 # ---------------------------------------------------------------------------
 
-DESCRIPTION_PREFIXES = [
-    "Card Purchase With Cashback",
-    "Chq Card ATM Local Cash Advanc Cash",
-    "Refund Chq Card Purchase Cr Vc",
-    "Rtc Express Credit",
-    "Rtc Express Pmt To",
-    "Paypal Withdrawal",
-    "Electricity Prepaid",
-    "Internet Airtime",
-    "Airtime Topup Airtime",
-    "Payment 1Day Cr",
-    "Payshap Credit",
-    "Fuel Purchase",
-    "Card Cashback Cashb",
-    "Card Purchase",
-    "Internet Pmt To",
-    "POS Purchase",
-    "Magtape Credit",
-    "Magtape Debit",
-    "Send Money App Dr Send",
-    "Send Money Dr Send",
-    "FNB App Transfer From",
-    "FNB App Payment To",
-    "FNB App Payment From",
-    "FNB App Rtc Pmt To",
-    "FNB OB Pmt",
-    "Payment To",
-    "Rtc Credit",
-    "Byc Debit",
-    "ATM Cash",
-]
+
+def _load_description_prefixes() -> dict[str, list[str]]:
+    """
+    Load transaction description prefixes from Supabase, keyed by bank.
+    Sorted longest-first so more specific prefixes match before shorter ones.
+    Falls back to an empty dict on error (extract_merchant still works, just
+    won't strip prefixes).
+    """
+    try:
+        response = (
+            supabase.table("transaction_prefixes")
+            .select("bank, prefix")
+            .order("prefix", desc=False)
+            .execute()
+        )
+        rows = response.data or []
+        prefixes: dict[str, list[str]] = {}
+        for row in rows:
+            bank = row["bank"]
+            prefixes.setdefault(bank, []).append(row["prefix"])
+        # Sort each bank's list longest-first for correct prefix matching
+        for bank in prefixes:
+            prefixes[bank].sort(key=len, reverse=True)
+        total = sum(len(v) for v in prefixes.values())
+        print(f"[STARTUP] Loaded {total} transaction prefixes for {list(prefixes.keys())}", file=sys.stderr)
+        return prefixes
+    except Exception as e:
+        print(f"[STARTUP WARNING] Could not load transaction prefixes: {e}", file=sys.stderr)
+        return {}
+
+
+DESCRIPTION_PREFIXES: dict[str, list[str]] = _load_description_prefixes()
 
 CARD_RE = re.compile(r"\d{6}\*\d{4}")
 AMOUNT_PREFIX_RE = re.compile(r"^[\d,]+\.\d{2}\s+")
@@ -138,14 +139,14 @@ TRAILING_DATE_RE = re.compile(r"\s+\d{2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|
 TRAILING_NUMBERS_RE = re.compile(r"\s+\d{8,}$")
 
 
-def extract_merchant(description: str) -> str:
+def extract_merchant(description: str, bank: str = "FNB") -> str:
     """Extract a human-readable merchant/payee name from a transaction description."""
     if not description.strip():
         return "Bank Fees"
 
     text = description
     matched_prefix = None
-    for prefix in DESCRIPTION_PREFIXES:
+    for prefix in DESCRIPTION_PREFIXES.get(bank, []):
         if text.startswith(prefix):
             matched_prefix = prefix
             text = text[len(prefix):].strip()

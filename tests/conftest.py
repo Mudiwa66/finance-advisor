@@ -66,3 +66,45 @@ sys.modules.setdefault("core.pdf_processor", MagicMock())
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app  # noqa: E402 — intentionally after sys.modules setup
+
+# ---------------------------------------------------------------------------
+# Seed DESCRIPTION_PREFIXES for tests (Supabase mock returns empty data)
+# ---------------------------------------------------------------------------
+
+app.DESCRIPTION_PREFIXES = {
+    "FNB": sorted(
+        [
+            "Card Purchase With Cashback",
+            "Chq Card ATM Local Cash Advanc Cash",
+            "Refund Chq Card Purchase Cr Vc",
+            "Rtc Express Credit",
+            "Rtc Express Pmt To",
+            "Paypal Withdrawal",
+            "Electricity Prepaid",
+            "Internet Airtime",
+            "Airtime Topup Airtime",
+            "Payment 1Day Cr",
+            "Payshap Credit",
+            "Fuel Purchase",
+            "Card Cashback Cashb",
+            "Card Purchase",
+            "Internet Pmt To",
+            "POS Purchase",
+            "Magtape Credit",
+            "Magtape Debit",
+            "Send Money App Dr Send",
+            "Send Money Dr Send",
+            "FNB App Transfer From",
+            "FNB App Payment To",
+            "FNB App Payment From",
+            "FNB App Rtc Pmt To",
+            "FNB OB Pmt",
+            "Payment To",
+            "Rtc Credit",
+            "Byc Debit",
+            "ATM Cash",
+        ],
+        key=len,
+        reverse=True,
+    )
+}
