@@ -854,7 +854,9 @@ def ask_llm_with_tools(
         "When the user mentions a time period, resolve it to exact YYYY-MM-DD dates relative "
         "to TODAY before calling tools. "
         "Keep responses concise — this is WhatsApp, under 80 words. "
-        "Use conversation history to resolve pronouns and follow-ups."
+        "Use conversation history to resolve pronouns and follow-ups. "
+        "When a tool returns data, report ONLY what the tool returned — never compare or "
+        "reconcile tool results against conversation history. Tool output is always authoritative."
     )
 
     messages: list[dict] = [{"role": "system", "content": system_msg}]
