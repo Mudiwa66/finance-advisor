@@ -1529,6 +1529,305 @@ def _get_user_id(user_hash: str) -> str | None:
         return None
 
 
+def _get_user_row(user_hash: str) -> dict | None:
+    """Return the full user row including onboarding fields, or None if not found."""
+    try:
+        r = (
+            supabase.table("users")
+            .select("id, onboarding_completed, onboarding_step, monthly_income")
+            .eq("phone_hash", user_hash)
+            .execute()
+        )
+        return r.data[0] if r.data else None
+    except Exception:
+        return None
+
+
+_STEP_UNSET = object()  # sentinel: don't update onboarding_step unless explicitly passed
+
+
+def _update_onboarding(
+    user_id: str,
+    step: object = _STEP_UNSET,
+    completed: bool | None = None,
+    income: float | None = None,
+) -> None:
+    update: dict = {}
+    if step is not _STEP_UNSET:
+        update["onboarding_step"] = step
+    if completed is not None:
+        update["onboarding_completed"] = completed
+    if income is not None:
+        update["monthly_income"] = income
+    if update:
+        try:
+            supabase.table("users").update(update).eq("id", user_id).execute()
+        except Exception as e:
+            print(f"[ONBOARDING] Update failed: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Onboarding message templates
+# ---------------------------------------------------------------------------
+
+_MSG_WELCOME = (
+    "Hi! I'm your financial advisor. 👋\n\n"
+    "I help people track spending, stick to budgets, and get out of debt.\n\n"
+    "Mind if I ask a few quick questions to understand your situation? Won't take long.\n\n"
+    "Say *yes* to continue, or *skip* to dive straight in."
+)
+
+_MSG_INCOME = (
+    "What's your monthly take-home? The amount that hits your account after tax.\n\n"
+    "Something like 'R12,000' or 'about 15k'. Or say *skip* if you'd rather not share."
+)
+
+_MSG_DEBT_CHECK = (
+    "Do you have any debt you're trying to pay off? "
+    "Credit cards, loans, store accounts, that kind of thing?\n\n"
+    "(Yes / No / Skip)"
+)
+
+_MSG_COLLECT_DEBTS = (
+    "Cool, I can help with that. Tell me about them one at a time — something like:\n\n"
+    "'ABSA 15k at 18%' or 'Mr Price 5000, 22 percent'\n\n"
+    "Say *done* when you're finished, or *later* to skip for now."
+)
+
+_MSG_STATEMENT = (
+    "Last thing — send me your latest bank statement (PDF) so I can see your spending.\n\n"
+    "FNB works best right now. Just send the file via WhatsApp.\n\n"
+    "Or say *later* if you don't have it handy — you can always send it after."
+)
+
+_MSG_COMPLETE = (
+    "All set! Here's what I can help with:\n\n"
+    "💰 *Spending*: 'how much on food last month?'\n"
+    "📊 *Budgets*: 'set transport budget R1500'\n"
+    "💳 *Debt*: 'show my debt plan'\n"
+    "📈 *Progress*: 'am I over budget?'\n\n"
+    "What would you like to know?"
+)
+
+# Keywords that indicate the user wants to skip onboarding entirely
+_SKIP_ALL_PHRASES = ("skip all", "just let me", "skip everything", "skip onboarding", "i'll figure")
+
+# Keywords suggesting user is asking a real question mid-onboarding
+_SPENDING_KEYWORDS = ("how much", "spent", "spending", "balance", "budget", "debt", "merchant", "transaction")
+
+
+# ---------------------------------------------------------------------------
+# Onboarding helpers
+# ---------------------------------------------------------------------------
+
+
+def _simple_result(text: str, intent: str = "onboarding") -> dict:
+    return {"content": text, "used_llm": False, "intent": intent, "confidence": 1.0, "tokens": 0}
+
+
+def _parse_income_amount(text: str) -> float | None:
+    """Extract a rand amount from natural language income descriptions."""
+    t = text.lower().replace(",", "").replace(" ", "")
+    # R12k, R12.5k
+    m = re.search(r"r(\d+(?:\.\d+)?)k", t)
+    if m:
+        return float(m.group(1)) * 1000
+    # R12000
+    m = re.search(r"r(\d{3,}(?:\.\d+)?)", t)
+    if m:
+        return float(m.group(1))
+    # plain 12k / about 12k
+    m = re.search(r"\b(\d+(?:\.\d+)?)k\b", t)
+    if m:
+        return float(m.group(1)) * 1000
+    # plain 12000+
+    m = re.search(r"\b(\d{4,}(?:\.\d+)?)\b", t)
+    if m:
+        return float(m.group(1))
+    # word amounts: "twelve thousand"
+    word_map = {
+        "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+        "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+        "twenty": 20, "twenty-five": 25, "twenty five": 25, "thirty": 30, "forty": 40, "fifty": 50,
+    }
+    for word, val in word_map.items():
+        if word in text.lower() and "thousand" in text.lower():
+            return float(val * 1000)
+    return None
+
+
+def _parse_debt_from_text(text: str) -> dict | None:
+    """
+    Try to extract (creditor, amount, rate) from casual debt descriptions.
+    e.g. 'ABSA 15k at 18%', 'Mr Price 5000, 22 percent', 'capitec 8k 21%'
+    Returns None if any required field is missing.
+    """
+    # Rate: 18%, 18 percent, 18pa, 18 p/a
+    rate = None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:%|percent|p\.?/?a\.?)", text, re.IGNORECASE)
+    if m:
+        rate = float(m.group(1))
+
+    # Amount: R15k, R15000, 15k, 15000
+    amount = None
+    m = re.search(r"[Rr]\s*(\d+(?:,\d{3})*(?:\.\d+)?)\s*k\b", text)
+    if m:
+        amount = float(m.group(1).replace(",", "")) * 1000
+    if not amount:
+        m = re.search(r"[Rr]\s*(\d{3,}(?:,\d{3})*(?:\.\d+)?)", text)
+        if m:
+            amount = float(m.group(1).replace(",", ""))
+    if not amount:
+        m = re.search(r"\b(\d+(?:,\d{3})*(?:\.\d+)?)\s*k\b", text, re.IGNORECASE)
+        if m:
+            amount = float(m.group(1).replace(",", "")) * 1000
+    if not amount:
+        m = re.search(r"\b(\d{4,}(?:,\d{3})*(?:\.\d+)?)\b", text)
+        if m:
+            amount = float(m.group(1).replace(",", ""))
+
+    if not amount or not rate:
+        return None
+
+    # Creditor: strip amount/rate tokens, take leading words
+    clean = re.sub(r"[Rr]?\s*\d+(?:,\d{3})*(?:\.\d+)?\s*k?", " ", text, flags=re.IGNORECASE)
+    clean = re.sub(r"\d+(?:\.\d+)?\s*(?:%|percent|p\.?/?a\.?)", " ", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"\b(at|for|of|owe|i|and|the|a|to)\b", " ", clean, flags=re.IGNORECASE)
+    words = [w.strip(".,") for w in clean.split() if w.strip(".,") and len(w.strip(".,")) > 1]
+    creditor = " ".join(words[:3]).strip() if words else None
+
+    if not creditor:
+        return None
+    return {"creditor_name": creditor, "amount_owed": amount, "interest_rate": rate}
+
+
+# ---------------------------------------------------------------------------
+# Onboarding flow handler
+# ---------------------------------------------------------------------------
+
+
+def _handle_onboarding(
+    message: str,
+    user_row: dict,
+    history: list[dict],
+    user_id: str,
+) -> dict:
+    """
+    Drive the conversational onboarding flow.
+    Returns the same dict format as handle_message.
+    """
+    step = user_row.get("onboarding_step")
+    msg_lower = message.lower().strip()
+
+    print(f"[ONBOARDING] step={step!r} msg={message[:60]!r}", file=sys.stderr)
+
+    # --- Skip-all override at any point ---
+    if any(p in msg_lower for p in _SKIP_ALL_PHRASES):
+        _update_onboarding(user_id, step="complete", completed=True)
+        return _simple_result(_MSG_COMPLETE)
+
+    # --- Mid-onboarding real question: answer it, then re-prompt current step ---
+    if step and step not in ("asked_continue",) and any(k in msg_lower for k in _SPENDING_KEYWORDS):
+        # Let the normal flow answer, then append onboarding continuation
+        result = handle_message(message, history=history, user_id=user_id)
+        step_prompts = {
+            "asked_income": _MSG_INCOME,
+            "asked_debt": _MSG_DEBT_CHECK,
+            "collecting_debts": "Add another debt, or say *done* to continue.",
+            "asked_statement": _MSG_STATEMENT,
+        }
+        if step in step_prompts:
+            result["content"] += f"\n\n---\n{step_prompts[step]}"
+        return result
+
+    # --- First message ever ---
+    if step is None:
+        _update_onboarding(user_id, step="asked_continue")
+        return _simple_result(_MSG_WELCOME)
+
+    # --- Step: asked_continue ---
+    if step == "asked_continue":
+        _AFFIRMATIVE = ("yes", "yeah", "yep", "sure", "ok", "okay", "yup", "let's go", "lets go", "go", "continue", "start")
+        _NEGATIVE = ("no", "skip", "nope", "later", "nah", "just", "straight")
+        is_yes = any(w in msg_lower for w in _AFFIRMATIVE)
+        is_no = any(w in msg_lower for w in _NEGATIVE)
+        if is_no and not is_yes:
+            _update_onboarding(user_id, step="complete", completed=True)
+            return _simple_result(_MSG_COMPLETE)
+        # Default to yes even for ambiguous replies
+        _update_onboarding(user_id, step="asked_income")
+        return _simple_result(_MSG_INCOME)
+
+    # --- Step: asked_income ---
+    if step == "asked_income":
+        if any(w in msg_lower for w in ("skip", "rather not", "private", "no", "nope", "pass")):
+            _update_onboarding(user_id, step="asked_debt")
+            return _simple_result(_MSG_DEBT_CHECK)
+        income = _parse_income_amount(message)
+        if income:
+            _update_onboarding(user_id, step="asked_debt", income=income)
+            return _simple_result(f"Got it — R{income:,.0f}/month. 👍\n\n{_MSG_DEBT_CHECK}")
+        # Couldn't parse — nudge gently
+        _update_onboarding(user_id, step="asked_debt")
+        return _simple_result(f"No worries, we'll skip that for now.\n\n{_MSG_DEBT_CHECK}")
+
+    # --- Step: asked_debt ---
+    if step == "asked_debt":
+        _YES = ("yes", "yeah", "yep", "sure", "yup", "got", "have", "do", "couple", "few", "some")
+        _NO = ("no", "nope", "nah", "none", "skip", "don't", "dont", "debt free", "clean")
+        is_yes = any(w in msg_lower for w in _YES)
+        is_no = any(w in msg_lower for w in _NO)
+        if is_no and not is_yes:
+            _update_onboarding(user_id, step="asked_statement")
+            return _simple_result(f"Nice! 🙌\n\n{_MSG_STATEMENT}")
+        _update_onboarding(user_id, step="collecting_debts")
+        return _simple_result(_MSG_COLLECT_DEBTS)
+
+    # --- Step: collecting_debts ---
+    if step == "collecting_debts":
+        _DONE = ("done", "that's it", "thats it", "finished", "later", "skip", "no more", "that's all", "thats all")
+        if any(w in msg_lower for w in _DONE):
+            _update_onboarding(user_id, step="asked_statement")
+            return _simple_result(_MSG_STATEMENT)
+        parsed = _parse_debt_from_text(message)
+        if parsed:
+            try:
+                _tool_add_debt(
+                    user_id=user_id,
+                    creditor_name=parsed["creditor_name"],
+                    amount_owed=parsed["amount_owed"],
+                    interest_rate=parsed["interest_rate"],
+                )
+                return _simple_result(
+                    f"Got it — {parsed['creditor_name']}: R{parsed['amount_owed']:,.0f} at {parsed['interest_rate']}%.\n\n"
+                    "Add another, or say *done* to continue."
+                )
+            except Exception as e:
+                print(f"[ONBOARDING] Debt save failed: {e}", file=sys.stderr)
+        # Parse failed — ask to rephrase
+        return _simple_result(
+            "Hmm, I didn't quite catch that. Try something like:\n"
+            "'ABSA 15k at 18%' or 'Mr Price 5000, 22%'\n\n"
+            "Or say *done* to move on."
+        )
+
+    # --- Step: asked_statement ---
+    if step == "asked_statement":
+        # PDF handled separately in webhook — here we just handle text
+        _LATER = ("later", "skip", "no", "nope", "don't have", "dont have", "not now")
+        if any(w in msg_lower for w in _LATER):
+            _update_onboarding(user_id, step="complete", completed=True)
+            return _simple_result(_MSG_COMPLETE)
+        return _simple_result(
+            "Just send the PDF file via WhatsApp whenever you're ready.\n\n"
+            "Or say *later* to finish setup and start using the bot."
+        )
+
+    # Fallback
+    _update_onboarding(user_id, step="complete", completed=True)
+    return _simple_result(_MSG_COMPLETE)
+
+
 def _load_chat_history(user_hash: str, limit: int = 5) -> list[dict]:
     """
     Load the last `limit` exchanges for a user as a list of
@@ -1619,6 +1918,15 @@ def webhook():
                 auth_token=TWILIO_AUTH_TOKEN,
             )
 
+            # If user uploaded PDF during onboarding's asked_statement step, complete onboarding
+            if pdf_result["success"]:
+                _uid = _get_user_id(user_hash)
+                if _uid:
+                    _urow = _get_user_row(user_hash)
+                    if _urow and not _urow.get("onboarding_completed") and _urow.get("onboarding_step") in ("asked_statement", "collecting_debts", None):
+                        _update_onboarding(_uid, step="complete", completed=True)
+                        pdf_result["message"] += f"\n\n{_MSG_COMPLETE}"
+
             total_time = time.monotonic() - start
             _log_metric(
                 user_hash=user_hash,
@@ -1648,11 +1956,16 @@ def webhook():
             resp.message("Got it — I've cleared our conversation history. Fresh start!")
             return str(resp), 200, {"Content-Type": "application/xml"}
 
-        # Load conversation history and resolve user_id for budget tools
-        user_id = _get_user_id(user_hash)
+        # Load user row (includes onboarding state) and chat history
+        user_row = _get_user_row(user_hash)
+        user_id = user_row["id"] if user_row else None
         history = _load_chat_history(user_hash)
 
-        result = handle_message(incoming_msg, history=history, user_id=user_id)
+        # Route through onboarding for new users
+        if user_row and not user_row.get("onboarding_completed", True):
+            result = _handle_onboarding(incoming_msg, user_row, history, user_id)
+        else:
+            result = handle_message(incoming_msg, history=history, user_id=user_id)
         total_time = time.monotonic() - start
 
         _save_chat_message(
